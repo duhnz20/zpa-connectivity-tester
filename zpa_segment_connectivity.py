@@ -80,7 +80,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-SCRIPT_VERSION = "1.2.3"
+SCRIPT_VERSION = "1.3.0"
 DEFAULT_API_BASE = "https://api.zsapi.net"
 OAUTH_AUDIENCE = "https://api.zscaler.com"
 ZPA_SYNTHETIC_NET = ipaddress.ip_network("100.64.0.0/10")
@@ -909,6 +909,302 @@ CSV_FIELDS = ["segment", "enabled", "ip_anchored", "entry_kind", "domain",
 
 OK_STATUSES = ("OPEN", "OPEN_FLAKY")
 
+# Statuses that are not failures: reachable, or deliberately not probed.
+NON_FAILURE_STATUSES = OK_STATUSES + ("UDP_NOT_PROBED", "WILDCARD_SKIPPED",
+                                      "NO_TCP_PORTS")
+
+# Caveat 1: IP/CIDR entries yield no synthetic IP, so neither a successful
+# connect nor a timeout says anything about whether ZPA steered the traffic.
+UNVERIFIABLE_KINDS = ("ip", "cidr")
+
+# Console listing cap — the CSV always holds every row. Without this, a
+# broadly-broken run replaces the summary with hundreds of lines.
+ACTION_LIST_CAP = 25
+
+
+def triage_failures(rows):
+    """Split failing rows into (action_required, unverifiable_here).
+
+    A flat failure list buries the findings that matter: on a real tenant the
+    IP/CIDR timeouts vastly outnumber the FQDN failures, and only the latter
+    are actionable from the endpoint.
+    """
+    action, unverifiable = [], []
+    for r in rows:
+        if str(r.get("status", "")) in NON_FAILURE_STATUSES:
+            continue
+        (unverifiable if r.get("entry_kind") in UNVERIFIABLE_KINDS
+         else action).append(r)
+    return action, unverifiable
+
+
+def coverage_report(stats, args, tcp_probes):
+    """Lines describing what the run actually verified, vs what it skipped.
+
+    The headline OPEN ratio is computed over probes that ran, so a heavily
+    sampled run can report ~100% reachable while having tested a tiny
+    fraction of the inventory. This states that fraction explicitly.
+    """
+    k = stats["kinds"]
+    direct_total = k["fqdn"] + k["ip"]
+    direct_probed = max(0, direct_total - stats["entries_sampled_out"])
+    ports_total = tcp_probes + stats["ports_truncated"]
+    pct = (100.0 * direct_probed / direct_total) if direct_total else 100.0
+    port_pct = (100.0 * tcp_probes / ports_total) if ports_total else 100.0
+
+    lines = [f"  fqdn/ip entries:   {direct_probed}/{direct_total} probed "
+             f"({pct:.1f}%)"]
+    if stats["entries_sampled_out"]:
+        lines.append(f"                     {stats['entries_sampled_out']} not "
+                     f"probed (--sample-domains {args.sample_domains})")
+    if k["cidr"]:
+        lines.append(f"  cidr entries:      {k['cidr']} expanded to sampled "
+                     f"hosts (--cidr-hosts {args.cidr_hosts})")
+    if k["wildcard"]:
+        probed_wc = "probed" if args.wildcard_probe else "NOT probed"
+        lines.append(f"  wildcard entries:  {k['wildcard']} {probed_wc}"
+                     + ("" if args.wildcard_probe
+                        else "  (--wildcard-probe LABEL)"))
+    lines.append(f"  tcp ports:         {tcp_probes}/{ports_total} probed "
+                 f"({port_pct:.1f}%)")
+    if stats["ports_truncated"]:
+        lines.append(f"                     {stats['ports_truncated']} dropped "
+                     f"(--max-ports {args.max_ports}; --scope full for all)")
+    return lines
+
+
+def next_steps(args, stats, action, unverifiable, dns_fail, dns_flush_ok,
+               intercepted):
+    """Recommendations derived from this run's actual results.
+
+    dns_flush_ok is the boolean from flush_dns_cache(): True fully flushed,
+    False attempted-but-incomplete, None not attempted. Do NOT infer this
+    from the detail string — macOS reports "dscacheutil=ok, killall=rc1"
+    for a FAILED flush, so substring-matching "ok" gets it backwards.
+    """
+    prog = os.path.basename(sys.argv[0]) or "zpa_segment_connectivity.py"
+    steps = []
+    if dns_fail and args.phase == "post":
+        if dns_flush_ok is False:
+            steps.append(
+                "The DNS cache flush did not fully succeed, and a stale "
+                "negative entry can fake a post-run DNS failure (caveat 2). "
+                "Re-run it with sudo before treating these as real:\n"
+                f"       sudo python3 {prog} test --phase post --flush-dns ...")
+        elif dns_flush_ok is None:
+            steps.append(
+                "This post run did not flush the DNS cache, so a negative "
+                "entry cached during the pre run can mask steering "
+                "(caveat 2). Re-run with --flush-dns (sudo on macOS).")
+        else:
+            steps.append(
+                f"{len(dns_fail)} DNS failure(s) with a clean cache flush: "
+                "confirm the domain is enrolled and assigned to your account, "
+                "then restart ZCC before treating it as real.")
+    if unverifiable:
+        segs = sorted({r["segment"] for r in unverifiable})
+        steps.append(
+            f"{len(unverifiable)} probe(s) across {len(segs)} segment(s) were "
+            "IP/CIDR entries, which cannot prove steering from an endpoint "
+            "(caveat 1). Confirm them in the ZPA admin portal's access logs.")
+    if stats["kinds"]["wildcard"] and not args.wildcard_probe:
+        steps.append(
+            f"{stats['kinds']['wildcard']} wildcard entries were not probed. "
+            "Re-run with --wildcard-probe www to cover them.")
+    if stats["entries_sampled_out"] or stats["ports_truncated"]:
+        steps.append(
+            "This was a sampled run — see Coverage above. Use --scope full "
+            "(or raise --sample-domains/--max-ports) for final validation; "
+            "a full run against wide CIDRs is a port sweep, so notify "
+            "whoever watches IDS first.")
+    if args.phase == "post" and not intercepted:
+        steps.append(
+            "No synthetic IPs were observed, so nothing proves ZPA is "
+            "steering yet. Check Private Access is ON and authenticated in "
+            "ZCC, and that your account is in the access policy.")
+    return steps
+
+
+# --------------------------------------------------------------------------
+# Summary rendering
+# --------------------------------------------------------------------------
+#
+# ASCII-only rules and glyphs here on purpose: this prints to a legacy
+# Windows console often enough that box-drawing characters are a real risk,
+# and a mangled separator is worse than a plain one.
+
+SECTION_WIDTH = 76
+INTERCEPT_LIST_CAP = 15
+SLOW_SEGMENT_CAP = 5
+ROLLUP_CAP = 20
+
+# Failure statuses grouped by what they actually imply. Lumping REFUSED in
+# with TIMEOUT is actively misleading: a refusal proves the path works.
+FAILURE_CLASSES = [
+    ("TIMEOUT", "nothing answered — traffic may not be steered, or is dropped"),
+    ("DNS_FAIL", "name did not resolve — check enrollment, then caveat 2"),
+    ("REFUSED", "host answered and declined — path works, nothing listening"),
+    ("OTHER", "probe/socket errors — see the CSV"),
+]
+
+
+def _section(title):
+    """A consistent section rule; long summaries are unscannable without it."""
+    bar = "-" * max(4, SECTION_WIDTH - len(title) - 6)
+    return f"\n  -- {title} {bar}"
+
+
+def classify_failure(status):
+    s = str(status)
+    if s == "TIMEOUT":
+        return "TIMEOUT"
+    if s == "REFUSED":
+        return "REFUSED"
+    if s.startswith("DNS_FAIL"):
+        return "DNS_FAIL"
+    return "OTHER"
+
+
+def run_verdict(args, intercepted, zcc):
+    """One-line answer to the question the run exists to settle.
+
+    The pre-phase branch matters: running --phase pre on a laptop that is
+    already enrolled silently captures a post-state labelled "pre", and the
+    later compare is then meaningless rather than obviously wrong.
+    """
+    n = len(intercepted)
+    if args.phase == "pre":
+        if n:
+            return ("BASELINE INVALID",
+                    f"{n} domain(s) already steered into ZPA — this is a "
+                    "post-state, not a pre-ZPA baseline")
+        return ("BASELINE CAPTURED",
+                "no synthetic IPs, as expected before ZPA is enabled")
+    if n:
+        return ("ZPA IS STEERING",
+                f"{n} domain(s) resolved into 100.64.0.0/10")
+    if zcc.get("state") != "running":
+        return ("NO STEERING OBSERVED",
+                "no synthetic IPs, and ZCC was not detected running")
+    return ("NO STEERING OBSERVED",
+            "ZCC is running but nothing resolved into the synthetic range")
+
+
+def status_histogram(rows):
+    """status -> count, collapsing the ':detail' suffix off error statuses."""
+    counts = {}
+    for r in rows:
+        s = str(r.get("status", ""))
+        if ":" in s:
+            s = s.split(":", 1)[0]
+        counts[s] = counts.get(s, 0) + 1
+    return counts
+
+
+def _port_list(ports):
+    """Compact, numerically sorted port list for a grouped failure line."""
+    nums, others = [], []
+    for p in ports:
+        try:
+            nums.append(int(p))
+        except (TypeError, ValueError):
+            if str(p):
+                others.append(str(p))
+    shown = [str(n) for n in sorted(set(nums))] + sorted(set(others))
+    if len(shown) > 8:
+        return ",".join(shown[:8]) + f",+{len(shown) - 8}"
+    return ",".join(shown)
+
+
+def group_failures(rows):
+    """Collapse to (segment, host, class) -> ports.
+
+    Without this, one unreachable host with a wide port range prints one
+    line per port and buries every other finding.
+    """
+    groups = {}
+    for r in rows:
+        key = (str(r.get("segment", "")), str(r.get("probe_domain", "")),
+               classify_failure(r.get("status")))
+        g = groups.setdefault(key, {"ports": [], "n": 0})
+        g["n"] += 1
+        p = r.get("port")
+        if p not in ("", None):
+            g["ports"].append(p)
+    return groups
+
+
+def latency_stats(rows):
+    """Percentiles over successful connects; None when nothing succeeded.
+
+    Already collected per probe and previously discarded — on a ZPA rollout
+    "is it slower now" is asked as often as "does it work".
+    """
+    vals = []
+    for r in rows:
+        if str(r.get("status", "")) not in OK_STATUSES:
+            continue
+        try:
+            vals.append(float(r.get("latency_ms")))
+        except (TypeError, ValueError):
+            continue
+    if not vals:
+        return None
+    vals.sort()
+
+    def pct(p):
+        if len(vals) == 1:
+            return vals[0]
+        return vals[min(len(vals) - 1,
+                        int(round((p / 100.0) * (len(vals) - 1))))]
+
+    return {"count": len(vals), "median_ms": round(pct(50), 1),
+            "p95_ms": round(pct(95), 1), "max_ms": round(vals[-1], 1)}
+
+
+def slowest_segments(rows, cap=SLOW_SEGMENT_CAP):
+    """[(segment, median_ms, n)] worst first — where latency actually lives."""
+    per = {}
+    for r in rows:
+        if str(r.get("status", "")) not in OK_STATUSES:
+            continue
+        try:
+            per.setdefault(str(r.get("segment", "")), []).append(
+                float(r.get("latency_ms")))
+        except (TypeError, ValueError):
+            continue
+    out = []
+    for seg, vals in per.items():
+        vals.sort()
+        out.append((seg, round(vals[len(vals) // 2], 1), len(vals)))
+    out.sort(key=lambda t: t[1], reverse=True)
+    return out[:cap]
+
+
+def segment_rollup(all_rows):
+    """Per-segment probed/open/failed/steered — the reportable view."""
+    segs = {}
+    for r in all_rows:
+        seg = str(r.get("segment", ""))
+        d = segs.setdefault(seg, {"probed": 0, "open": 0, "failed": 0,
+                                  "dns_fail": 0, "steered": False,
+                                  "kinds": set()})
+        kind = r.get("entry_kind", "")
+        if kind:
+            d["kinds"].add(kind)
+        st = str(r.get("status", ""))
+        if str(r.get("zpa_intercepted")) == "True":
+            d["steered"] = True
+        if st.startswith("DNS_FAIL"):
+            d["dns_fail"] += 1
+        elif r.get("protocol") == "tcp" and st != "NO_TCP_PORTS":
+            d["probed"] += 1
+            if st in OK_STATUSES:
+                d["open"] += 1
+            else:
+                d["failed"] += 1
+    return segs
+
 
 def run_test(args):
     args.scope_resolved = choose_scope(args)
@@ -924,10 +1220,10 @@ def run_test(args):
                 not in ("y", "yes"):
             sys.exit("Aborted.")
 
-    dns_flush = "not attempted"
+    dns_flush, dns_flush_ok = "not attempted", None
     if args.flush_dns:
         ok_flush, detail = flush_dns_cache()
-        dns_flush = detail
+        dns_flush, dns_flush_ok = detail, ok_flush
         print(f"[*] DNS cache flush: {detail}")
         if not ok_flush:
             print("    [!] Flush incomplete — stale negative cache entries "
@@ -1041,6 +1337,8 @@ def run_test(args):
     # ZCC is actively steering these segments into ZPA.
     zpa_evidence = ("synthetic IPs observed" if intercepted
                     else "no synthetic IPs observed")
+    verdict_label, verdict_detail = run_verdict(args, intercepted, zcc)
+    lat = latency_stats(all_rows)
 
     meta = {
         "script_version": SCRIPT_VERSION,
@@ -1064,12 +1362,19 @@ def run_test(args):
         "zcc": zcc,
         "dns_cache_flush": dns_flush,
         "zpa_evidence": zpa_evidence,
+        "verdict": verdict_label,
+        "verdict_detail": verdict_detail,
         "stats": stats,
         "results": {"tcp_probes": len(tcp_rows), "open": len(open_),
                     "flaky": len(flaky), "dns_failures": len(dns_fail),
                     "intercepted_domains": len(intercepted),
                     "wildcards_skipped": len(skipped_wildcards),
                     "worker_errors": worker_errors},
+        "status_counts": status_histogram(all_rows),
+        "latency": lat,
+        "slowest_segments": [{"segment": s, "median_ms": m, "probes": n}
+                             for s, m, n in slowest_segments(all_rows)],
+        "intercepted_domain_list": sorted(intercepted),
     }
     meta_path = os.path.join(out_dir, stem + ".meta.json")
     with open(meta_path, "w", encoding="utf-8") as f:
@@ -1078,32 +1383,115 @@ def run_test(args):
     print()
     print(f"=== {args.phase.upper()} run summary "
           f"({args.scope_resolved} scope, {host}, {ts}) ===")
-    print(f"  TCP probes:        {len(open_)}/{len(tcp_rows)} OPEN"
-          + (f" ({len(flaky)} only after retry)" if flaky else ""))
-    print(f"  DNS failures:      {len(dns_fail)} domains")
-    print(f"  ZPA-intercepted:   {len(intercepted)} domains resolved to "
-          f"synthetic IPs (100.64.0.0/10)")
-    print(f"  ZCC detection:     {zcc['state']}; {zpa_evidence}")
-    print(f"  Wildcards skipped: {len(skipped_wildcards)}")
+    print(f"  VERDICT   {verdict_label}")
+    print(f"            {verdict_detail}")
+    hist = status_histogram(all_rows)
+    order = [s for s in ("OPEN", "OPEN_FLAKY") if s in hist] + sorted(
+        (s for s in hist if s not in ("OPEN", "OPEN_FLAKY")),
+        key=lambda s: -hist[s])
+    print("  RESULTS   " + "  ".join(f"{s} {hist[s]}" for s in order))
     if worker_errors:
-        print(f"  [!] Probe errors:  {worker_errors} target(s) raised — see "
+        print(f"  [!] {worker_errors} target(s) raised a probe error — see "
               "PROBE_ERROR rows in the CSV")
-    print(f"  Results CSV:       {out_path}")
-    print(f"  Run metadata:      {meta_path}")
 
-    failures = [r for r in tcp_rows if r["status"] not in OK_STATUSES]
-    failures += dns_fail
-    if failures and args.show_failures:
-        print("\n  Failures:")
-        for r in sorted(failures, key=lambda r: (r["segment"], r["domain"],
-                                                 str(r["probe_domain"]))):
-            print(f"    {r['segment']:<40} {r['probe_domain']:<40} "
-                  f"{r['protocol']}/{r['port']} {r['status']}")
+    print(_section("COVERAGE"))
+    for line in coverage_report(stats, args, len(tcp_rows)):
+        print(line)
+
+    if lat:
+        print(_section("LATENCY (successful connects)"))
+        print(f"  median {lat['median_ms']}ms   p95 {lat['p95_ms']}ms   "
+              f"max {lat['max_ms']}ms   over {lat['count']} probes")
+        slow = slowest_segments(all_rows)
+        if len(slow) > 1:
+            print("  slowest segments (median):")
+            for seg, med, n in slow:
+                print(f"    {seg:<44} {med:>8.1f}ms  "
+                      f"({n} probe{'' if n == 1 else 's'})")
+
+    if intercepted:
+        print(_section("ZPA-STEERED DOMAINS"))
+        shown = sorted(intercepted)[:INTERCEPT_LIST_CAP]
+        for d in shown:
+            print(f"    {d}")
+        if len(intercepted) > INTERCEPT_LIST_CAP:
+            print(f"    ... +{len(intercepted) - INTERCEPT_LIST_CAP} more "
+                  "(zpa_intercepted=True in the CSV)")
+
+    rollup = segment_rollup(all_rows)
+    if len(rollup) > 1:
+        print(_section("SEGMENT HEALTH"))
+        print(f"    {'segment':<40} {'probed':>7} {'open':>6} {'failed':>7} "
+              f"{'steered':>8}")
+        ranked = sorted(rollup.items(),
+                        key=lambda kv: (-kv[1]["failed"] - kv[1]["dns_fail"],
+                                        kv[0]))
+        for seg, d in ranked[:ROLLUP_CAP]:
+            if d["kinds"] and d["kinds"].issubset(set(UNVERIFIABLE_KINDS)):
+                steer = "n/a"
+            else:
+                steer = "yes" if d["steered"] else "no"
+            failed = d["failed"] + d["dns_fail"]
+            print(f"    {seg[:40]:<40} {d['probed']:>7} {d['open']:>6} "
+                  f"{failed:>7} {steer:>8}")
+        if len(ranked) > ROLLUP_CAP:
+            print(f"    ... +{len(ranked) - ROLLUP_CAP} more segments")
+
+    action, unverifiable = triage_failures(all_rows)
+    if args.show_failures:
+        print(_section(f"FINDINGS ({len(action)} actionable)"))
+        if not action:
+            print("    none — every probed entry behaved as expected")
+        else:
+            groups = group_failures(action)
+            shown_rows = 0
+            for cls, meaning in FAILURE_CLASSES:
+                sel = {k: v for k, v in groups.items() if k[2] == cls}
+                if not sel:
+                    continue
+                total = sum(v["n"] for v in sel.values())
+                print(f"\n    {cls}  ({total} probes) — {meaning}")
+                for (seg, hostname, _), g in sorted(
+                        sel.items(), key=lambda kv: (-kv[1]["n"], kv[0])):
+                    if shown_rows >= ACTION_LIST_CAP:
+                        break
+                    ports = _port_list(g["ports"])
+                    print(f"      {seg[:34]:<34} {hostname[:30]:<30} "
+                          + (f"tcp/{ports}" if ports else ""))
+                    shown_rows += 1
+            remaining = len(groups) - shown_rows
+            if remaining > 0:
+                print(f"\n    ... +{remaining} more grouped finding(s) — full "
+                      "list in the CSV, or --report for the HTML view")
+
+        if unverifiable:
+            by_seg = {}
+            for r in unverifiable:
+                by_seg.setdefault(r["segment"], set()).add(
+                    str(r["probe_domain"]))
+            print(f"\n    UNVERIFIABLE HERE ({len(unverifiable)} probes) — "
+                  "IP/CIDR entries; confirm in the ZPA portal (caveat 1)")
+            for seg in sorted(by_seg):
+                hosts = sorted(by_seg[seg])
+                shown = ", ".join(hosts[:4]) + (
+                    f", +{len(hosts) - 4} more" if len(hosts) > 4 else "")
+                print(f"      {seg[:34]:<34} {shown}")
+
+    steps = next_steps(args, stats, action, unverifiable, dns_fail,
+                       dns_flush_ok, intercepted)
+    if steps:
+        print(_section("NEXT STEPS"))
+        for i, s in enumerate(steps, 1):
+            print(f"    {i}. {s}")
+
+    print(_section("OUTPUT"))
+    print(f"    CSV       {out_path}")
+    print(f"    metadata  {meta_path}")
 
     if args.report:
         html_path = os.path.join(out_dir, stem + ".html")
         write_html_report(html_path, [(out_path, all_rows, meta)])
-        print(f"\n  HTML report:       {html_path}")
+        print(f"    report    {html_path}")
     return out_path
 
 
@@ -1219,6 +1607,36 @@ def run_compare(args):
         print(f"  no longer intercepted: {len(lost)}")
         for d in sorted(lost):
             print(f"    - {d}")
+
+    # Latency delta — "is it slower now" is asked as often as "does it work",
+    # and pre/post is the only pairing that can actually answer it.
+    lat_pre = latency_stats(load_rows(args.pre_csv))
+    lat_post = latency_stats(load_rows(args.post_csv))
+    if lat_pre and lat_post:
+        print("\nLatency (successful connects):")
+        print(f"  {'':<8} {'median':>11} {'p95':>11} {'probes':>8}")
+        print(f"  {'pre':<8} {lat_pre['median_ms']:>9.1f}ms "
+              f"{lat_pre['p95_ms']:>9.1f}ms {lat_pre['count']:>8}")
+        print(f"  {'post':<8} {lat_post['median_ms']:>9.1f}ms "
+              f"{lat_post['p95_ms']:>9.1f}ms {lat_post['count']:>8}")
+        d_med = lat_post["median_ms"] - lat_pre["median_ms"]
+        d_p95 = lat_post["p95_ms"] - lat_pre["p95_ms"]
+        print(f"  {'delta':<8} {d_med:>+9.1f}ms {d_p95:>+9.1f}ms")
+        pct = (100.0 * d_med / lat_pre["median_ms"]
+               if lat_pre["median_ms"] else 0.0)
+        if abs(d_med) < 0.05 or abs(pct) < 1:
+            print("  median is effectively unchanged post-ZPA")
+        else:
+            print(f"  median is {abs(pct):.0f}% "
+                  f"{'slower' if d_med > 0 else 'faster'} post-ZPA")
+        # A handful of probes cannot support a performance claim; say so
+        # rather than let a 2-probe delta read as a finding.
+        if min(lat_pre["count"], lat_post["count"]) < 30:
+            print("  (few successful probes — treat this delta as "
+                  "indicative only)")
+    elif lat_post and not lat_pre:
+        print("\nLatency: post-run only (no successful connects in the pre "
+              "run to compare against)")
 
     if args.html:
         out = os.path.abspath(os.path.expanduser(args.html))
@@ -1347,6 +1765,16 @@ def write_html_report(out_path, runs, diff=None):
                                  f"{html.escape(str(val))}</div>")
             parts.append("</div>")
 
+        if meta.get("verdict"):
+            vcls = ("ok" if meta["verdict"] in ("ZPA IS STEERING",
+                                                "BASELINE CAPTURED")
+                    else "bad" if meta["verdict"] == "BASELINE INVALID"
+                    else "warn")
+            parts.append(
+                f'<p class="sub"><b class="{vcls}">'
+                f'{html.escape(meta["verdict"])}</b> &mdash; '
+                f'{html.escape(str(meta.get("verdict_detail", "")))}</p>')
+
         parts.append('<div class="tiles">')
         parts.append(_tile(f"{len(open_)}/{len(tcp)}", "TCP reachable",
                            "ok" if len(open_) == len(tcp) and tcp else "warn"))
@@ -1357,6 +1785,9 @@ def write_html_report(out_path, runs, diff=None):
         parts.append(_tile(len(dns_fail), "DNS failures",
                            "bad" if dns_fail else "ok"))
         parts.append(_tile(len(interc), "ZPA-steered domains", "info"))
+        lat_m = (meta.get("latency") or {}).get("median_ms")
+        if lat_m is not None:
+            parts.append(_tile(f"{lat_m}ms", "median latency", "info"))
         parts.append("</div>")
 
         tid = "t" + re.sub(r"\W", "", os.path.basename(csv_path))[:20]

@@ -1,5 +1,36 @@
 # Changelog
 
+## v1.3.0
+Output is now built around what to do next, rather than a flat probe dump.
+Validated 145/145 on Linux, macOS (Python 3.9), and Windows 11 (Python 3.14).
+
+- **A verdict line** states whether the run proved anything: `ZPA IS
+  STEERING`, `NO STEERING OBSERVED`, `BASELINE CAPTURED`, or `BASELINE
+  INVALID`. The last one catches a silent trap — running `--phase pre` on
+  an endpoint that is already enrolled records a post-state labelled
+  "pre", which previously only surfaced as a nonsensical `compare`.
+- **Failures are grouped by host and by what they imply.** `REFUSED` is
+  no longer lumped in with `TIMEOUT`: a refusal proves the path works and
+  nothing is listening, while a timeout is the signature of traffic not
+  being steered. One unreachable host with a wide port range now prints
+  one line instead of one line per port.
+- **Latency is summarized instead of discarded.** Median/p95/max plus the
+  slowest segments per run, and `compare` reports the pre-vs-post delta.
+  Deltas from small samples are labelled indicative rather than stated as
+  findings.
+- **Segment health table** — per-segment probed/open/failed/steered, the
+  view that answers "which segments are broken".
+- **ZPA-steered domains are listed**, not just counted.
+- **Status histogram** and consistent section headers throughout. Rules
+  are ASCII, since box-drawing characters corrupt on legacy Windows
+  consoles.
+- `meta.json` gains `verdict`, `status_counts`, `latency`,
+  `slowest_segments`, and `intercepted_domain_list`; the HTML report
+  gains a verdict banner and a median-latency tile.
+- **Coverage section** states what fraction of the inventory was actually
+  probed, so a heavily sampled run cannot read as full validation.
+- **Next steps** are derived from the run's own results.
+
 ## v1.2.3
 - **Fixed a crash when `--targets-file` points at a missing file.** The
   preflight check flags it, but that failure is overridable (the prompt, or

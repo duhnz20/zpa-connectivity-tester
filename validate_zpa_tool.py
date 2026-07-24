@@ -312,20 +312,21 @@ def main():
             check("missing targets file exits cleanly", False,
                   "raised FileNotFoundError traceback")
 
-        # unreadable file (permission denied) must also be clean
-        p_noperm = os.path.join(_tdir, "noperm.json")
-        with open(p_noperm, "w", encoding="utf-8") as f:
-            json.dump(seg_min, f)
+        # An unopenable path must exit cleanly too. Use a directory rather
+        # than chmod 0: Windows ignores POSIX mode bits for read access, so
+        # the chmod approach cannot create the condition there at all.
+        # open(<dir>) raises IsADirectoryError on POSIX and PermissionError
+        # on Windows — both OSError, both the branch under test.
+        p_dir = os.path.join(_tdir, "a-directory.json")
+        os.makedirs(p_dir, exist_ok=True)
         try:
-            os.chmod(p_noperm, 0)
-            m.load_segments(Args(targets_file=p_noperm))
-            check("unreadable targets file exits cleanly", False, "no exit")
+            m.load_segments(Args(targets_file=p_dir))
+            check("unopenable targets path exits cleanly", False, "no exit")
         except SystemExit:
-            check("unreadable targets file exits cleanly", True)
-        except OSError:
-            check("unreadable targets file exits cleanly", False, "raised OSError")
-        finally:
-            os.chmod(p_noperm, 0o644)
+            check("unopenable targets path exits cleanly", True)
+        except OSError as e:
+            check("unopenable targets path exits cleanly", False,
+                  f"raised {type(e).__name__}")
 
         # a JSON scalar is neither shape -> clean exit, not a traceback
         p_bad = os.path.join(_tdir, "bad.json")
@@ -348,6 +349,162 @@ def main():
               segs3[0]["name"] == "東京-Bürö", segs3[0]["name"])
     finally:
         shutil.rmtree(_tdir, ignore_errors=True)
+
+    print("\nResult triage / coverage")
+    trows = [
+        {"entry_kind": "fqdn", "status": "OPEN", "segment": "A",
+         "probe_domain": "a.corp", "domain": "a.corp"},
+        {"entry_kind": "fqdn", "status": "DNS_FAIL:x", "segment": "A",
+         "probe_domain": "b.corp", "domain": "b.corp"},
+        {"entry_kind": "cidr", "status": "TIMEOUT", "segment": "B",
+         "probe_domain": "10.1.0.1", "domain": "10.1.0.0/24"},
+        {"entry_kind": "ip", "status": "TIMEOUT", "segment": "B",
+         "probe_domain": "10.2.0.5", "domain": "10.2.0.5"},
+        {"entry_kind": "wildcard", "status": "WILDCARD_SKIPPED", "segment": "C",
+         "probe_domain": "", "domain": "*.c.corp"},
+        {"entry_kind": "fqdn", "status": "UDP_NOT_PROBED", "segment": "A",
+         "probe_domain": "a.corp", "domain": "a.corp"},
+    ]
+    act, unv = m.triage_failures(trows)
+    check("triage: only real fqdn failures are action-required",
+          len(act) == 1 and act[0]["probe_domain"] == "b.corp", str(len(act)))
+    check("triage: ip/cidr failures are unverifiable, not action-required",
+          len(unv) == 2 and all(r["entry_kind"] in ("ip", "cidr") for r in unv))
+    check("triage: OPEN / skipped / not-probed are not failures",
+          len(act) + len(unv) == 3)
+
+    cstats = {"entries_sampled_out": 3008, "ports_truncated": 21780,
+              "kinds": {"fqdn": 3000, "ip": 74, "cidr": 6, "wildcard": 462}}
+    cov = "\n".join(m.coverage_report(cstats, Args(wildcard_probe=None), 380))
+    check("coverage: reports probed/total entries honestly",
+          "66/3074" in cov, cov.splitlines()[0].strip())
+    check("coverage: reports the port fraction",
+          "380/22160" in cov)
+    check("coverage: flags wildcards as NOT probed",
+          "462 NOT probed" in cov)
+    cov2 = "\n".join(m.coverage_report(cstats, Args(wildcard_probe="www"), 380))
+    check("coverage: wildcards counted as probed when --wildcard-probe set",
+          "462 probed" in cov2)
+
+    steps = m.next_steps(Args(phase="post", wildcard_probe=None), cstats,
+                         act, unv, [{"status": "DNS_FAIL:x"}],
+                         False, set())
+    joined = " ".join(steps)
+    check("next steps: flags an incomplete DNS flush before blaming DNS",
+          any("sudo" in s for s in steps), str(len(steps)) + " steps")
+    check("next steps: points ip/cidr findings at the portal",
+          "access logs" in joined)
+    check("next steps: recommends --wildcard-probe when wildcards skipped",
+          "--wildcard-probe" in joined)
+    check("next steps: warns when no synthetic IPs were seen post-run",
+          "Private Access" in joined)
+    steps_ok = m.next_steps(Args(phase="post", wildcard_probe="www"),
+                            {"entries_sampled_out": 0, "ports_truncated": 0,
+                             "kinds": {"fqdn": 1, "ip": 0, "cidr": 0,
+                                       "wildcard": 0}},
+                            [], [], [], "ok", {"a.corp"})
+    check("next steps: silent when a run is clean and complete",
+          steps_ok == [], str(steps_ok))
+    # regression: macOS reports "dscacheutil=ok, killall=rc1" for a FAILED
+    # flush, so this must key off the boolean, not the detail string
+    s_none = " ".join(m.next_steps(Args(phase="post", wildcard_probe="www"),
+                      {"entries_sampled_out": 0, "ports_truncated": 0,
+                       "kinds": {"fqdn": 1, "ip": 0, "cidr": 0, "wildcard": 0}},
+                      [], [], [{"status": "DNS_FAIL:x"}], None, {"a"}))
+    check("next steps: distinguishes flush-not-attempted from flush-failed",
+          "--flush-dns" in s_none and "sudo python3" not in s_none, s_none[:60])
+    s_ok = " ".join(m.next_steps(Args(phase="post", wildcard_probe="www"),
+                    {"entries_sampled_out": 0, "ports_truncated": 0,
+                     "kinds": {"fqdn": 1, "ip": 0, "cidr": 0, "wildcard": 0}},
+                    [], [], [{"status": "DNS_FAIL:x"}], True, {"a"}))
+    check("next steps: clean flush + DNS failure blames enrollment, not cache",
+          "enrolled" in s_ok and "sudo" not in s_ok, s_ok[:60])
+
+    print("\nSummary rendering (actionability)")
+    # 1 — verdict resolves the question the run exists to answer
+    v, d = m.run_verdict(Args(phase="post"), {"a.corp"}, {"state": "running"})
+    check("post + synthetic IPs -> steering verdict", v == "ZPA IS STEERING", v)
+    v, d = m.run_verdict(Args(phase="post"), set(), {"state": "running"})
+    check("post + none -> no-steering verdict", v == "NO STEERING OBSERVED", v)
+    v, d = m.run_verdict(Args(phase="pre"), set(), {"state": "not_detected"})
+    check("pre + none -> valid baseline", v == "BASELINE CAPTURED", v)
+    # the trap: a 'pre' run on an already-enrolled endpoint is not a baseline
+    v, d = m.run_verdict(Args(phase="pre"), {"a.corp"}, {"state": "running"})
+    check("pre + already steered -> BASELINE INVALID",
+          v == "BASELINE INVALID", v)
+
+    # 3 — failure classes are distinguished by what they imply
+    check("TIMEOUT classified", m.classify_failure("TIMEOUT") == "TIMEOUT")
+    check("REFUSED classified separately from TIMEOUT",
+          m.classify_failure("REFUSED") == "REFUSED")
+    check("DNS_FAIL:detail classified", m.classify_failure(
+        "DNS_FAIL:[Errno 8] nodename nor servname") == "DNS_FAIL")
+    check("unknown status -> OTHER",
+          m.classify_failure("ERROR:whatever") == "OTHER")
+
+    # 2 — grouping collapses one-line-per-port into one line per host+class
+    frows = [{"segment": "S", "probe_domain": "h1", "status": "TIMEOUT",
+              "port": p, "entry_kind": "fqdn"} for p in (1, 2, 3, 22, 1000)]
+    frows.append({"segment": "S", "probe_domain": "h1", "status": "REFUSED",
+                  "port": 443, "entry_kind": "fqdn"})
+    g = m.group_failures(frows)
+    check("6 rows collapse to 2 groups (one per status class)", len(g) == 2,
+          str(sorted(k[2] for k in g)))
+    tkey = ("S", "h1", "TIMEOUT")
+    check("group records every port", g[tkey]["n"] == 5)
+    check("port list is numerically sorted and compact",
+          m._port_list(g[tkey]["ports"]) == "1,2,3,22,1000",
+          m._port_list(g[tkey]["ports"]))
+    check("long port lists are truncated with a count",
+          m._port_list(list(range(1, 30))).endswith(",+21"),
+          m._port_list(list(range(1, 30))))
+
+    # 7 — status histogram + section headers
+    h = m.status_histogram([{"status": "OPEN"}, {"status": "OPEN"},
+                            {"status": "TIMEOUT"},
+                            {"status": "DNS_FAIL:[Errno 8] boom"}])
+    check("histogram counts by status", h.get("OPEN") == 2
+          and h.get("TIMEOUT") == 1)
+    check("histogram collapses ':detail' suffixes", h.get("DNS_FAIL") == 1,
+          str(h))
+    check("section header is ASCII-only (legacy Windows console safe)",
+          all(ord(c) < 128 for c in m._section("COVERAGE")),
+          m._section("COVERAGE").strip())
+
+    # 4 — latency is summarized rather than discarded
+    lrows = [{"status": "OPEN", "latency_ms": v, "segment": "A"}
+             for v in (10, 20, 30, 40, 100)]
+    lrows.append({"status": "TIMEOUT", "latency_ms": "", "segment": "A"})
+    st = m.latency_stats(lrows)
+    check("latency median computed over successes only",
+          st["count"] == 5 and st["median_ms"] == 30, str(st))
+    check("latency p95 and max reported",
+          st["p95_ms"] == 100 and st["max_ms"] == 100, str(st))
+    check("latency_stats returns None when nothing succeeded",
+          m.latency_stats([{"status": "TIMEOUT", "latency_ms": ""}]) is None)
+    slow = m.slowest_segments(
+        lrows + [{"status": "OPEN", "latency_ms": 500, "segment": "B"}])
+    check("slowest segment ranked first", slow[0][0] == "B", str(slow))
+
+    # 5 — per-segment rollup
+    rr = [{"segment": "A", "protocol": "tcp", "status": "OPEN",
+           "entry_kind": "fqdn", "zpa_intercepted": "True"},
+          {"segment": "A", "protocol": "tcp", "status": "TIMEOUT",
+           "entry_kind": "fqdn", "zpa_intercepted": "True"},
+          {"segment": "B", "protocol": "tcp", "status": "TIMEOUT",
+           "entry_kind": "cidr", "zpa_intercepted": "N/A"},
+          {"segment": "A", "protocol": "dns", "status": "DNS_FAIL:x",
+           "entry_kind": "fqdn", "zpa_intercepted": ""}]
+    ru = m.segment_rollup(rr)
+    check("rollup counts probed/open/failed per segment",
+          ru["A"]["probed"] == 2 and ru["A"]["open"] == 1
+          and ru["A"]["failed"] == 1, str(ru["A"]))
+    check("rollup counts dns failures separately",
+          ru["A"]["dns_fail"] == 1)
+    check("rollup marks steered segments", ru["A"]["steered"] is True)
+    check("ip/cidr-only segment is not marked steered",
+          ru["B"]["steered"] is False
+          and ru["B"]["kinds"].issubset(set(m.UNVERIFIABLE_KINDS)))
 
     print("\nCredential gathering")
     _saved = {k: os.environ.get(k) for k in
