@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -815,6 +816,56 @@ def main():
               and meta.get("segment_source") == "targets-file")
         check("meta records sampling config",
               meta["sampling"]["retries"] == 1 and meta["sampling"]["l7"])
+
+        # --- clickable tile filters ---
+        # Tile counts come from Python; the click-to-filter predicates are
+        # JavaScript. If they drift, a tile reads "4 failing probes" and
+        # clicking it shows a different number, silently. Mirror the JS here
+        # and assert each tile selects exactly what it claims.
+        _h = open(csv_path.replace(".csv", ".html"), encoding="utf-8").read()
+        _rows = [{"status": g[0], "proto": g[1], "steered": g[2]}
+                 for g in re.findall(
+                     r'<tr data-status="([^"]*)" data-proto="([^"]*)" '
+                     r'data-steered="([^"]*)"', _h)]
+        _tiles = dict(re.findall(
+            r'<div class="tile" data-tilefilter="([a-z]+)"[^>]*>'
+            r'<div class="n [^"]*">([^<]*)</div>', _h))
+        check("every row carries machine-readable state",
+              len(_rows) == len(rows), f"{len(_rows)} of {len(rows)}")
+        check("all five filterable tiles are present",
+              set(_tiles) == {"reachable", "failing", "flaky", "dnsfail",
+                              "steered"}, str(sorted(_tiles)))
+
+        def _ok(s):
+            return s in ("OPEN", "OPEN_FLAKY")
+
+        def _tcp(d):
+            return d["proto"] == "tcp" and d["status"] != "NO_TCP_PORTS"
+
+        _pred = {
+            "reachable": lambda d: _tcp(d) and _ok(d["status"]),
+            "failing": lambda d: _tcp(d) and not _ok(d["status"]),
+            "flaky": lambda d: d["proto"] == "tcp"
+            and d["status"] == "OPEN_FLAKY",
+            "dnsfail": lambda d: d["status"].startswith("DNS_FAIL"),
+            "steered": lambda d: d["steered"] == "True",
+        }
+        for _k in sorted(_pred):
+            _sel = sum(1 for d in _rows if _pred[_k](d))
+            _claim = _tiles.get(_k, "0")
+            _want = int(str(_claim).split("/")[0])
+            # the steered tile counts unique domains; rows may exceed it
+            _agree = (_sel >= _want) if _k == "steered" else (_sel == _want)
+            check(f"tile '{_k}' filter selects what the tile claims", _agree,
+                  f"tile={_claim} selects={_sel}")
+
+        check("median-latency tile is not clickable (a median is not rows)",
+              'data-tilefilter="latency"' not in _h)
+        check("status cells are clickable",
+              _h.count("statuscell") >= len(_rows), str(_h.count("statuscell")))
+        check("tiles are bound to their table",
+              'class="tiles" data-target="#' in _h)
+        check("tile filters are keyboard reachable", 'tabindex="0"' in _h)
 
         html_path = csv_path.replace(".csv", ".html")
         doc = open(html_path, encoding="utf-8").read()

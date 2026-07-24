@@ -80,7 +80,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-SCRIPT_VERSION = "1.4.1"
+SCRIPT_VERSION = "1.4.2"
 DEFAULT_API_BASE = "https://api.zsapi.net"
 OAUTH_AUDIENCE = "https://api.zscaler.com"
 ZPA_SYNTHETIC_NET = ipaddress.ip_network("100.64.0.0/10")
@@ -1983,6 +1983,20 @@ h2 { font-size:1.1rem; margin:2rem 0 .6rem; }
 .tile { background:var(--card); border:1px solid var(--line);
   border-radius:10px; padding:.85rem 1rem; }
 .tile .n { font-size:1.6rem; font-weight:650; letter-spacing:-.02em; }
+.tile[data-tilefilter] { cursor:pointer; -webkit-user-select:none;
+  user-select:none; transition:border-color .12s ease, transform .12s ease; }
+.tile[data-tilefilter]:hover { border-color:var(--info); }
+.tile[data-tilefilter]:focus-visible { outline:2px solid var(--info);
+  outline-offset:2px; }
+.tile[data-tilefilter].active { border-color:var(--info);
+  box-shadow:inset 0 0 0 1px var(--info); }
+.filterbar { display:flex; gap:.6rem; align-items:center; }
+.filterbar button { font:inherit; font-size:.82rem; cursor:pointer;
+  border:1px solid var(--line); background:var(--card); color:var(--fg);
+  border-radius:6px; padding:.15rem .5rem; }
+.filterbar button:hover { border-color:var(--info); }
+td.statuscell { cursor:pointer; }
+td.statuscell:hover { text-decoration:underline; }
 .tile .l { color:var(--muted); font-size:.78rem; text-transform:uppercase;
   letter-spacing:.06em; margin-top:.15rem; }
 .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)}
@@ -2006,16 +2020,110 @@ input[type=search]{ width:100%; max-width:340px; padding:.45rem .6rem;
 """
 
 HTML_JS = """
-document.querySelectorAll('input[data-filter]').forEach(function(box){
-  box.addEventListener('input', function(){
-    var q = box.value.toLowerCase();
-    var rows = document.querySelectorAll(box.dataset.filter + ' tbody tr');
-    rows.forEach(function(tr){
-      tr.style.display = tr.textContent.toLowerCase().indexOf(q) > -1
-        ? '' : 'none';
+(function(){
+  // Predicates mirror the Python that computed each tile's count, reading
+  // the row's data-* attributes rather than its rendered text — a text
+  // match on "OPEN" would also catch OPEN_FLAKY and any segment name
+  // containing "open".
+  function ok(s){ return s === 'OPEN' || s === 'OPEN_FLAKY'; }
+  function tcp(d){ return d.proto === 'tcp' && d.status !== 'NO_TCP_PORTS'; }
+  var PRED = {
+    reachable: function(d){ return tcp(d) && ok(d.status); },
+    failing:   function(d){ return tcp(d) && !ok(d.status); },
+    flaky:     function(d){ return d.proto === 'tcp'
+                                   && d.status === 'OPEN_FLAKY'; },
+    dnsfail:   function(d){ return d.status.indexOf('DNS_FAIL') === 0; },
+    steered:   function(d){ return d.steered === 'True'; }
+  };
+  var LABEL = {
+    reachable: 'TCP reachable', failing: 'failing probes',
+    flaky: 'flaky (retry only)', dnsfail: 'DNS failures',
+    steered: 'ZPA-steered rows'
+  };
+
+  document.querySelectorAll('table[id]').forEach(function(table){
+    var sel   = '#' + table.id;
+    var tiles = document.querySelector('.tiles[data-target="' + sel + '"]');
+    var box   = document.querySelector('input[data-filter="' + sel + '"]');
+    var bar   = document.querySelector('.filterbar[data-for="' + sel + '"]');
+    var rows  = Array.prototype.slice.call(
+                  table.querySelectorAll('tbody tr'));
+    var active = null;               // tile filter key, or a {status:...}
+
+    function apply(){
+      var q = (box && box.value ? box.value : '').toLowerCase();
+      var shown = 0;
+      rows.forEach(function(tr){
+        var d = { status:  tr.getAttribute('data-status')  || '',
+                  proto:   tr.getAttribute('data-proto')   || '',
+                  steered: tr.getAttribute('data-steered') || '' };
+        var pass = true;
+        if (active && active.status !== undefined) {
+          pass = d.status === active.status;
+        } else if (active && PRED[active]) {
+          pass = PRED[active](d);
+        }
+        if (pass && q) {
+          pass = tr.textContent.toLowerCase().indexOf(q) > -1;
+        }
+        tr.style.display = pass ? '' : 'none';
+        if (pass) { shown++; }
+      });
+      if (tiles) {
+        tiles.querySelectorAll('[data-tilefilter]').forEach(function(t){
+          t.classList.toggle('active',
+            active === t.getAttribute('data-tilefilter'));
+        });
+      }
+      if (bar) {
+        if (active) {
+          var name = (active.status !== undefined)
+            ? 'status = ' + active.status
+            : (LABEL[active] || active);
+          bar.hidden = false;
+          bar.innerHTML = '';
+          bar.appendChild(document.createTextNode(
+            'Filtered to ' + name + ' \\u2014 showing ' + shown +
+            ' of ' + rows.length + ' rows. '));
+          var btn = document.createElement('button');
+          btn.type = 'button';
+          btn.textContent = 'Clear filter';
+          btn.addEventListener('click', function(){ active = null; apply(); });
+          bar.appendChild(btn);
+        } else {
+          bar.hidden = true;
+          bar.textContent = '';
+        }
+      }
+    }
+
+    function toggle(key){
+      var same = (typeof key === 'string')
+        ? active === key
+        : (active && active.status === key.status);
+      active = same ? null : key;
+      apply();
+    }
+
+    if (tiles) {
+      tiles.querySelectorAll('[data-tilefilter]').forEach(function(t){
+        var key = t.getAttribute('data-tilefilter');
+        t.addEventListener('click', function(){ toggle(key); });
+        t.addEventListener('keydown', function(e){
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault(); toggle(key);
+          }
+        });
+      });
+    }
+    table.querySelectorAll('td.statuscell').forEach(function(td){
+      td.addEventListener('click', function(){
+        toggle({ status: td.getAttribute('data-statusval') || '' });
+      });
     });
+    if (box) { box.addEventListener('input', apply); }
   });
-});
+})();
 """
 
 
@@ -2030,9 +2138,19 @@ def _status_class(status):
     return "info"
 
 
-def _tile(n, label, cls=""):
-    return (f'<div class="tile"><div class="n {cls}">{html.escape(str(n))}'
-            f'</div><div class="l">{html.escape(label)}</div></div>')
+def _tile(n, label, cls="", filt=None):
+    """A stat tile; with filt it also becomes a one-click table filter.
+
+    The counts were previously read-only, so narrowing to "just the
+    failures" meant typing into the search box and hoping the substring did
+    not also match a segment name.
+    """
+    attr = f' data-tilefilter="{html.escape(filt)}" tabindex="0"' if filt else ""
+    title = ' title="Click to filter the table; click again to clear"' if filt \
+        else ""
+    return (f'<div class="tile"{attr}{title}>'
+            f'<div class="n {cls}">{html.escape(str(n))}</div>'
+            f'<div class="l">{html.escape(label)}</div></div>')
 
 
 def write_html_report(out_path, runs, diff=None):
@@ -2085,24 +2203,31 @@ def write_html_report(out_path, runs, diff=None):
                 f'{html.escape(meta["verdict"])}</b> &mdash; '
                 f'{html.escape(str(meta.get("verdict_detail", "")))}</p>')
 
-        parts.append('<div class="tiles">')
+        # tid first: the tiles need to know which table they drive
+        tid = "t" + re.sub(r"\W", "", os.path.basename(csv_path))[:20]
+
+        parts.append(f'<div class="tiles" data-target="#{tid}">')
         parts.append(_tile(f"{len(open_)}/{len(tcp)}", "TCP reachable",
-                           "ok" if len(open_) == len(tcp) and tcp else "warn"))
+                           "ok" if len(open_) == len(tcp) and tcp else "warn",
+                           filt="reachable"))
         parts.append(_tile(len(fails), "failing probes",
-                           "bad" if fails else "ok"))
+                           "bad" if fails else "ok", filt="failing"))
         parts.append(_tile(len(flaky), "flaky (retry only)",
-                           "warn" if flaky else ""))
+                           "warn" if flaky else "", filt="flaky"))
         parts.append(_tile(len(dns_fail), "DNS failures",
-                           "bad" if dns_fail else "ok"))
-        parts.append(_tile(len(interc), "ZPA-steered domains", "info"))
+                           "bad" if dns_fail else "ok", filt="dnsfail"))
+        parts.append(_tile(len(interc), "ZPA-steered domains", "info",
+                           filt="steered"))
         lat_m = (meta.get("latency") or {}).get("median_ms")
         if lat_m is not None:
+            # a median is not a row set — deliberately not a filter
             parts.append(_tile(f"{lat_m}ms", "median latency", "info"))
         parts.append("</div>")
 
-        tid = "t" + re.sub(r"\W", "", os.path.basename(csv_path))[:20]
         parts.append(f'<input type="search" data-filter="#{tid}" '
                      f'placeholder="Filter rows...">')
+        parts.append(f'<p class="note filterbar" data-for="#{tid}" '
+                     f'hidden></p>')
         parts.append(f'<div class="scroll"><table id="{tid}"><thead><tr>')
         cols = ["segment", "entry_kind", "domain", "probe_domain",
                 "resolved_ip", "zpa_intercepted", "protocol", "port",
@@ -2111,11 +2236,23 @@ def write_html_report(out_path, runs, diff=None):
             parts.append(f"<th>{html.escape(c)}</th>")
         parts.append("</tr></thead><tbody>")
         for r in rows:
-            parts.append("<tr>")
+            # machine-readable row state so the tile predicates match the
+            # Python that computed the counts, rather than re-deriving it
+            # from the rendered text
+            st = str(r.get("status", ""))
+            parts.append(
+                f'<tr data-status="{html.escape(st)}" '
+                f'data-proto="{html.escape(str(r.get("protocol", "")))}" '
+                f'data-steered="{html.escape(str(r.get("zpa_intercepted", "")))}">')
             for c in cols:
                 v = r.get(c, "")
-                cls = f' class="{_status_class(v)}"' if c == "status" else ""
-                parts.append(f"<td{cls}>{html.escape(str(v))}</td>")
+                if c == "status":
+                    parts.append(f'<td class="{_status_class(v)} statuscell" '
+                                 f'data-statusval="{html.escape(str(v))}" '
+                                 f'title="Click to filter on this status">'
+                                 f'{html.escape(str(v))}</td>')
+                else:
+                    parts.append(f"<td>{html.escape(str(v))}</td>")
             parts.append("</tr>")
         parts.append("</tbody></table></div>")
 

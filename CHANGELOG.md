@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.4.2
+Validated 195/195 on Linux and macOS, 194/194 on Windows 11.
+
+- **The HTML report's stat tiles are now click-to-filter.** Clicking
+  *failing probes*, *TCP reachable*, *flaky*, *DNS failures* or
+  *ZPA-steered domains* narrows the results table to exactly those rows;
+  clicking again clears it. Previously the tiles were inert and the only
+  way to narrow the table was the free-text box, which matched whole rows
+  — typing `OPEN` also matched `OPEN_FLAKY` and any segment name
+  containing "open", and there was no way to ask for "everything that
+  failed".
+- **Status cells are clickable too** — click a `TIMEOUT` cell to see every
+  timeout.
+- Tile filters compose with the search box, are keyboard reachable, and
+  show a "showing N of M rows" bar with a clear button. The median-latency
+  tile is deliberately not clickable: a median is not a set of rows.
+- Rows now carry `data-status` / `data-proto` / `data-steered`, so the
+  filter predicates match the Python that computed the tile counts rather
+  than re-deriving state from rendered text. The suite asserts each tile's
+  filter selects exactly what the tile claims, so the two cannot drift.
+- The report remains fully self-contained — no external references.
+
 ## v1.4.1
 Validated 184/184 on Linux and macOS, 183/183 on Windows 11.
 
