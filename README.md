@@ -4,7 +4,7 @@ Admin tool for validating reachability to ZPA application segments from an
 endpoint running Zscaler Client Connector. Run it before ZPA is enabled for
 an account, again after, then diff the two runs.
 
-- Script: `zpa_segment_connectivity.py` (v1.3.0)
+- Script: `zpa_segment_connectivity.py` (v1.3.1)
 - Python 3.9+, standard library only — **no `pip install`**
 - Windows / macOS / Linux. Read-only against the ZPA API (GET).
 - **Runs entirely on your own machine.** Nothing is installed or sent
@@ -99,8 +99,21 @@ see caveat 2 below.
 
 ```
 python3 zpa_segment_connectivity.py compare \
-    zpa-test-results/pre_sample_<host>_<ts>.csv \
-    zpa-test-results/post_sample_<host>_<ts>.csv \
+    zpa-test-results/pre_sample_HOST_TIMESTAMP.csv \
+    zpa-test-results/post_sample_HOST_TIMESTAMP.csv \
+    --html readout.html
+```
+
+Substitute the real filenames — `ls zpa-test-results/` shows them. Do not
+paste `<host>` literally: in bash and zsh `<` is a redirection operator, so
+a placeholder in angle brackets fails with `no such file or directory: host`
+before the tool ever runs. On macOS/Linux the shell will expand a glob for
+you:
+
+```
+python3 zpa_segment_connectivity.py compare \
+    zpa-test-results/pre_sample_*.csv \
+    zpa-test-results/post_sample_*.csv \
     --html readout.html
 ```
 

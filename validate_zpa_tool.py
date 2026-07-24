@@ -420,6 +420,55 @@ def main():
     check("next steps: clean flush + DNS failure blames enrollment, not cache",
           "enrolled" in s_ok and "sudo" not in s_ok, s_ok[:60])
 
+    print("\nRun-size safety ceiling")
+    # Real numbers from a --scope full run against a 22-segment tenant:
+    # 6,958,550 targets / ~456 billion probes. The tool merely *asked* for
+    # confirmation, and the run could never have finished.
+    HUGE = 456_009_725_001
+    best, worst = m.estimate_duration(HUGE, Args(workers=20, timeout=5.0))
+    check("worst case for a real full-scope run is measured in years",
+          worst / 31_536_000 > 1000, m.format_duration(worst))
+    check("even the best case is impractical",
+          best / 86_400 > 100, m.format_duration(best))
+    try:
+        m.confirm_run(HUGE, Args(scope_resolved="full", workers=20,
+                                 timeout=5.0, yes=False))
+        check("absurd run is refused", False, "not refused")
+    except SystemExit as e:
+        msg = str(e.code)
+        check("absurd run is refused outright", True)
+        check("refusal names the narrowing options",
+              "--scope sample" in msg and "--max-ports" in msg)
+        check("refusal explains the port-sweep implication",
+              "port sweep" in msg)
+    # --yes means unattended, not unbounded: it must NOT bypass the ceiling
+    try:
+        m.confirm_run(HUGE, Args(scope_resolved="full", workers=20,
+                                 timeout=5.0, yes=True))
+        check("--yes does not bypass the ceiling", False, "bypassed")
+    except SystemExit:
+        check("--yes does not bypass the ceiling", True)
+    # explicit override still works for someone who means it
+    try:
+        m.confirm_run(HUGE, Args(scope_resolved="full", workers=20,
+                                 timeout=5.0, yes=True, force_huge_run=True))
+        check("--force-huge-run overrides the ceiling", True)
+    except SystemExit as e:
+        check("--force-huge-run overrides the ceiling", False, str(e.code)[:40])
+    # a normal sampled run is unaffected
+    try:
+        m.confirm_run(500, Args(scope_resolved="sample", workers=20,
+                                timeout=5.0, yes=False))
+        check("ordinary sampled run passes without prompting", True)
+    except SystemExit as e:
+        check("ordinary sampled run passes without prompting", False,
+              str(e.code)[:40])
+    check("format_duration scales to years",
+          m.format_duration(3.15e9).endswith("years"),
+          m.format_duration(3.15e9))
+    check("format_duration handles seconds",
+          m.format_duration(45) == "45s", m.format_duration(45))
+
     print("\nSummary rendering (actionability)")
     # 1 — verdict resolves the question the run exists to answer
     v, d = m.run_verdict(Args(phase="post"), {"a.corp"}, {"state": "running"})

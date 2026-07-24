@@ -1,5 +1,29 @@
 # Changelog
 
+## v1.3.1
+Safety fix. Validated 155/155 on Linux, macOS, and Windows 11.
+
+- **Runs that cannot finish are now refused, not merely confirmed.** A
+  `--scope full` run against a 22-segment tenant (3,962 entries, 156 CIDR
+  entries expanded to every usable host, against full port ranges) planned
+  ~456 billion probes — roughly 3,615 years at 20 workers, and still about
+  4 years if every probe answered instantly. The tool printed the count and
+  asked for confirmation, but a number that large does not read as
+  impossible. It now estimates wall-clock duration and exits above a
+  12-hour worst case, listing the flags that narrow the run
+  (`--scope sample`, `--max-ports`, `--cidr-hosts`, `--segment`,
+  `--enabled-only`) and stating that a sweep of that size reaches the App
+  Connectors as a port scan.
+  - `--yes` does **not** bypass the ceiling: unattended is not unbounded.
+  - `--force-huge-run` overrides it deliberately.
+- **The confirmation prompt now shows estimated duration** at ordinary
+  sizes too, so the cost of a run is visible before agreeing to it.
+- **README:** the `compare` example used `<host>`/`<ts>` placeholders.
+  Pasting it verbatim fails in bash and zsh with
+  `no such file or directory: host`, because `<` is a redirection operator
+  and the shell errors before the tool runs. Replaced with plain
+  placeholders plus a glob form that works as written.
+
 ## v1.3.0
 Output is now built around what to do next, rather than a flat probe dump.
 Validated 145/145 on Linux, macOS (Python 3.9), and Windows 11 (Python 3.14).

@@ -80,13 +80,14 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-SCRIPT_VERSION = "1.3.0"
+SCRIPT_VERSION = "1.3.1"
 DEFAULT_API_BASE = "https://api.zsapi.net"
 OAUTH_AUDIENCE = "https://api.zscaler.com"
 ZPA_SYNTHETIC_NET = ipaddress.ip_network("100.64.0.0/10")
 PAGE_SIZE = 500
 FULL_CIDR_HOST_CAP = 65536   # hard memory guard even in full scope
 CONFIRM_THRESHOLD = 2000     # confirm before runs bigger than this
+MAX_RUN_SECONDS = 12 * 3600  # refuse runs whose worst case exceeds this
 
 # Best-effort ZCC process names. These vary by ZCC version and platform —
 # absence is a hint, not proof, and is reported as such.
@@ -748,14 +749,63 @@ def choose_scope(args):
         print("  enter 1 or 2")
 
 
+def format_duration(seconds):
+    """Human-scale duration; a raw probe count hides what it actually costs."""
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m"
+    if seconds < 172800:
+        return f"{seconds / 3600:.1f}h"
+    if seconds < 63072000:
+        return f"{seconds / 86400:,.0f} days"
+    return f"{seconds / 31536000:,.0f} years"
+
+
+def estimate_duration(n_probes, args):
+    """(best_s, worst_s) wall clock for n_probes at this concurrency.
+
+    worst = every probe burns the full timeout; best = every probe answers
+    immediately. A real run lands between, but the worst case is the number
+    that matters when deciding whether to start at all.
+    """
+    workers = max(1, int(getattr(args, "workers", 20) or 20))
+    timeout = float(getattr(args, "timeout", 5.0) or 5.0)
+    return n_probes / (workers * 200.0), n_probes * timeout / workers
+
+
 def confirm_run(n_probes, args):
+    best, worst = estimate_duration(n_probes, args)
+
+    # A full-scope run against a real tenant can plan hundreds of billions of
+    # probes — 156 CIDRs expanded to every host, times a 1-65535 port range.
+    # Confirming that is not enough: it cannot finish, and what it emits is an
+    # enormous port sweep against the App Connectors. Deliberately NOT
+    # bypassed by --yes, because --yes means "unattended", not "unbounded".
+    if worst > MAX_RUN_SECONDS and not getattr(args, "force_huge_run", False):
+        sys.exit(
+            f"ERROR: this run plans ~{n_probes:,} probes across "
+            f"{max(1, int(args.workers))} workers — about "
+            f"{format_duration(worst)} at worst case, "
+            f"{format_duration(best)} if everything answers instantly.\n"
+            "It cannot complete, and at this size it is a large port sweep "
+            "against your App Connectors.\n\n"
+            "Narrow it first:\n"
+            "    --scope sample       representative subset (start here)\n"
+            "    --max-ports N        cap TCP ports per segment\n"
+            "    --cidr-hosts N       cap hosts probed per CIDR entry\n"
+            "    --segment SUBSTR     one segment at a time\n"
+            "    --enabled-only       skip disabled segments\n\n"
+            "Override only if you genuinely intend it: --force-huge-run")
+
     if args.yes:
         return
     if args.scope_resolved == "sample" and n_probes <= CONFIRM_THRESHOLD:
         return
-    ans = ask(f"About to run ~{n_probes} probes from this endpoint. "
-              "Proceed? [y/N]: ",
-              f"ERROR: {n_probes} probes planned but no terminal to "
+    ans = ask(f"About to run ~{n_probes:,} probes from this endpoint "
+              f"(~{format_duration(worst)} worst case, "
+              f"~{format_duration(best)} best). Proceed? [y/N]: ",
+              f"ERROR: {n_probes:,} probes planned but no terminal to "
               "confirm — re-run with --yes to proceed unattended."
               ).strip().lower()
     if ans not in ("y", "yes"):
@@ -2241,6 +2291,11 @@ def main():
                         "still records every probe)")
     t.add_argument("--yes", action="store_true",
                    help="skip preflight and probe-count confirmations")
+    t.add_argument("--force-huge-run", action="store_true",
+                   help="override the safety ceiling that refuses runs which "
+                        "cannot realistically finish (a full-scope run over "
+                        "wide CIDRs and full port ranges can plan billions of "
+                        "probes and amounts to a port sweep)")
     add_api_args(t)
     t.set_defaults(func=run_test)
 
