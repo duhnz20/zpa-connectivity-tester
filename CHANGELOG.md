@@ -1,5 +1,32 @@
 # Changelog
 
+## v1.4.0
+Saved tenants. Validated 178/178 on Linux and macOS, 177/177 on Windows 11
+(one assertion is POSIX-only).
+
+- **New `tenants` subcommand** — `add`, `list`, `remove`. A pilot usually
+  spans a model/test tenant and production; saving each removes the need to
+  retype four OneAPI values per run, and removes the chance of pasting the
+  wrong set.
+- **Selecting a tenant is confirmed twice**, and the second confirmation
+  requires typing the tenant name rather than another y/N. A second yes/no
+  gets answered reflexively; the failure being guarded against is sweeping
+  production while believing you are on the model tenant. Production
+  tenants are flagged `** PRODUCTION **` in every listing.
+- `--tenant NAME` skips the menu and still confirms twice.
+  `--tenant NAME --yes` skips confirmation, for scripted runs where the
+  choice is already explicit. Explicit `--client-id` / `--vanity-domain` /
+  `--customer-id` still win over saved values, and the environment
+  variables behave as before.
+- **The client secret is only stored if you opt in.** The default remains
+  that it is prompted each run and never written to disk; opting in states
+  plainly that it is stored in plaintext.
+- The store is `~/.zpa-connectivity-tester/tenants.json`, created mode
+  `0600` at creation time (not chmod'd afterwards, so there is no window
+  where it is world-readable), inside a `0700` directory. Loading warns if
+  the permissions have since been widened. `$ZPA_TENANT_STORE` overrides
+  the location.
+
 ## v1.3.1
 Safety fix. Validated 155/155 on Linux, macOS, and Windows 11.
 

@@ -420,6 +420,128 @@ def main():
     check("next steps: clean flush + DNS failure blames enrollment, not cache",
           "enrolled" in s_ok and "sudo" not in s_ok, s_ok[:60])
 
+    print("\nSaved tenants")
+    _tstore = os.path.join(tempfile.mkdtemp(prefix="zpa-tenants-"),
+                           "tenants.json")
+    _prev_store = os.environ.get("ZPA_TENANT_STORE")
+    os.environ["ZPA_TENANT_STORE"] = _tstore
+    _orig_ask = m.ask
+    try:
+        check("store path honours ZPA_TENANT_STORE",
+              m.tenant_store_path() == _tstore)
+        check("missing store reads as empty, not an error",
+              m.load_tenant_store() == {"tenants": []})
+
+        doc = {"tenants": [
+            {"name": "model", "production": False, "client_id": "mid",
+             "vanity_domain": "acme-model", "customer_id": "1111"},
+            {"name": "production", "production": True, "client_id": "pid",
+             "vanity_domain": "acme", "customer_id": "9999",
+             "client_secret": "s3cret"}]}
+        m.save_tenant_store(doc)
+        check("store round-trips", m.load_tenant_store() == doc)
+        if os.name != "nt":
+            mode = os.stat(_tstore).st_mode & 0o777
+            check("store is written 0600, not widened later", mode == 0o600,
+                  oct(mode))
+        check("find_tenant is case-insensitive",
+              m.find_tenant(doc, "PRODUCTION")["client_id"] == "pid")
+        check("find_tenant returns None for unknown",
+              m.find_tenant(doc, "staging") is None)
+
+        # tenant values must not clobber an explicit flag
+        a = Args(client_id="from-flag", vanity_domain=None, customer_id=None)
+        m.apply_tenant(a, m.find_tenant(doc, "model"))
+        check("explicit --client-id wins over the saved tenant",
+              a.client_id == "from-flag")
+        check("unset fields are filled from the tenant",
+              a.vanity_domain == "acme-model" and a.customer_id == "1111")
+        check("tenant name recorded on args", a.tenant_name == "model")
+        a2 = Args(client_id=None, vanity_domain=None, customer_id=None)
+        m.apply_tenant(a2, m.find_tenant(doc, "production"))
+        check("saved secret is applied when present",
+              a2.client_secret == "s3cret")
+
+        # --- the double confirmation ---
+        answers = []
+        m.ask = lambda prompt, msg: answers.pop(0)
+        prod = m.find_tenant(doc, "production")
+
+        answers[:] = ["y", "production"]
+        try:
+            m.confirm_tenant_choice(prod)
+            check("correct name at the 2nd prompt proceeds", True)
+        except SystemExit as e:
+            check("correct name at the 2nd prompt proceeds", False, str(e.code))
+
+        answers[:] = ["y", "model"]
+        try:
+            m.confirm_tenant_choice(prod)
+            check("wrong name at the 2nd prompt aborts", False, "proceeded")
+        except SystemExit as e:
+            check("wrong name at the 2nd prompt aborts", True)
+            check("abort message names both values",
+                  "model" in str(e.code) and "production" in str(e.code))
+
+        answers[:] = ["n"]
+        try:
+            m.confirm_tenant_choice(prod)
+            check("declining the 1st prompt aborts", False, "proceeded")
+        except SystemExit:
+            check("declining the 1st prompt aborts", True)
+
+        # a bare "y" twice must NOT be enough for the name prompt
+        answers[:] = ["y", "y"]
+        try:
+            m.confirm_tenant_choice(prod)
+            check("a second bare 'y' is not accepted", False, "proceeded")
+        except SystemExit:
+            check("a second bare 'y' is not accepted", True)
+
+        # --tenant NAME resolution
+        answers[:] = ["y", "production"]
+        sel = m.select_tenant(Args(tenant="production", yes=False))
+        check("--tenant selects and confirms", sel["client_id"] == "pid")
+        sel = m.select_tenant(Args(tenant="model", yes=True))
+        check("--tenant with --yes skips confirmation (scripted intent)",
+              sel["client_id"] == "mid")
+        try:
+            m.select_tenant(Args(tenant="staging", yes=True))
+            check("unknown --tenant exits", False, "no exit")
+        except SystemExit as e:
+            check("unknown --tenant exits", True)
+            check("unknown-tenant error lists configured names",
+                  "model" in str(e.code) and "production" in str(e.code))
+        # interactive selection is the default path when --tenant is absent
+        answers[:] = ["2", "y", "production"]
+        sel = m.select_tenant(Args(tenant=None, yes=False))
+        check("interactive pick + double confirm selects production",
+              sel["client_id"] == "pid", str(sel and sel.get("name")))
+        answers[:] = ["0"]
+        check("choice 0 opts out to manual credential entry",
+              m.select_tenant(Args(tenant=None, yes=False)) is None)
+        answers[:] = ["model", "y", "model"]
+        sel = m.select_tenant(Args(tenant=None, yes=False))
+        check("tenant can be chosen by name at the menu",
+              sel["client_id"] == "mid")
+
+        # an empty store must fall through to env/prompt, not show a menu
+        _empty_dir = tempfile.mkdtemp(prefix="zpa-empty-")
+        os.environ["ZPA_TENANT_STORE"] = os.path.join(_empty_dir, "t.json")
+        try:
+            check("empty store -> None, so env/prompt still works",
+                  m.select_tenant(Args(tenant=None, yes=False)) is None)
+        finally:
+            os.environ["ZPA_TENANT_STORE"] = _tstore
+            shutil.rmtree(_empty_dir, ignore_errors=True)
+    finally:
+        m.ask = _orig_ask
+        if _prev_store is None:
+            os.environ.pop("ZPA_TENANT_STORE", None)
+        else:
+            os.environ["ZPA_TENANT_STORE"] = _prev_store
+        shutil.rmtree(os.path.dirname(_tstore), ignore_errors=True)
+
     print("\nRun-size safety ceiling")
     # Real numbers from a --scope full run against a 22-segment tenant:
     # 6,958,550 targets / ~456 billion probes. The tool merely *asked* for

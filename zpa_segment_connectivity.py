@@ -80,7 +80,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-SCRIPT_VERSION = "1.3.1"
+SCRIPT_VERSION = "1.4.0"
 DEFAULT_API_BASE = "https://api.zsapi.net"
 OAUTH_AUDIENCE = "https://api.zscaler.com"
 ZPA_SYNTHETIC_NET = ipaddress.ip_network("100.64.0.0/10")
@@ -310,6 +310,257 @@ def http_json(url, ctx, headers=None, data=None, timeout=30, retries=4):
             delay = min(delay * 2, 30)
 
 
+# --------------------------------------------------------------------------
+# Saved tenants
+# --------------------------------------------------------------------------
+#
+# Most pilots run against two tenants — a model/test one and production —
+# and retyping four OneAPI values per run invites pasting the wrong set.
+# Saving them removes that, but it also means picking the wrong entry now
+# silently points every probe at the wrong company's infrastructure, so
+# selection is confirmed twice and production tenants are flagged.
+#
+# The client secret is only stored if explicitly opted into: the tool's
+# baseline promise is that the secret never touches disk, and that is worth
+# keeping as the default.
+
+TENANT_STORE_ENV = "ZPA_TENANT_STORE"
+DEFAULT_TENANT_DIR = "~/.zpa-connectivity-tester"
+TENANT_FIELDS = ("client_id", "vanity_domain", "customer_id")
+
+NO_TTY_TENANT = ("ERROR: no interactive terminal to choose a tenant — pass "
+                 "--tenant NAME (with --yes to skip confirmation).")
+
+
+def tenant_store_path():
+    override = os.environ.get(TENANT_STORE_ENV)
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.join(
+        os.path.abspath(os.path.expanduser(DEFAULT_TENANT_DIR)),
+        "tenants.json")
+
+
+def _warn_if_readable_by_others(path):
+    """POSIX only; Windows mode bits do not describe real ACLs."""
+    if os.name == "nt":
+        return
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except OSError:
+        return
+    if mode & 0o077:
+        print(f"[!] {path} is readable by other users (mode {mode:o}) — "
+              f"run: chmod 600 {path}")
+
+
+def load_tenant_store():
+    path = tenant_store_path()
+    if not os.path.isfile(path):
+        return {"tenants": []}
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            doc = json.load(f)
+    except (OSError, ValueError) as e:
+        sys.exit(f"ERROR: cannot read tenant store {path}: {e}")
+    if not isinstance(doc, dict) or not isinstance(doc.get("tenants"), list):
+        sys.exit(f"ERROR: {path} is not a tenant store — expected a JSON "
+                 "object with a 'tenants' list.")
+    _warn_if_readable_by_others(path)
+    return doc
+
+
+def save_tenant_store(doc):
+    """Write 0600 from creation — never widen-then-narrow."""
+    path = tenant_store_path()
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)
+    try:
+        os.chmod(parent, 0o700)
+    except OSError:
+        pass
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
+
+def find_tenant(doc, name):
+    for t in doc.get("tenants") or []:
+        if str(t.get("name", "")).lower() == str(name).lower():
+            return t
+    return None
+
+
+def _describe_tenant(t):
+    tag = "  ** PRODUCTION **" if t.get("production") else ""
+    secret = "secret saved" if t.get("client_secret") else "secret prompted"
+    return (f"{t.get('name', '?')}{tag}\n"
+            f"        vanity domain : {t.get('vanity_domain', '?')}\n"
+            f"        customer id   : {t.get('customer_id', '?')}\n"
+            f"        client id     : {t.get('client_id', '?')}\n"
+            f"        {secret}")
+
+
+def confirm_tenant_choice(t):
+    """Two independent confirmations before a tenant is used.
+
+    The second requires typing the tenant name rather than another y/N:
+    a second yes/no is answered reflexively, and the failure being guarded
+    against is running a probe sweep against production while believing it
+    is the model tenant.
+    """
+    name = str(t.get("name", ""))
+    kind = ("PRODUCTION tenant" if t.get("production")
+            else "non-production tenant")
+    print(f"\n  Selected {kind}:")
+    print("    " + _describe_tenant(t).replace("\n", "\n    "))
+    first = ask(f"\n  Run against '{name}'? [y/N]: ",
+                NO_TTY_TENANT).strip().lower()
+    if first not in ("y", "yes"):
+        sys.exit("Aborted.")
+    second = ask(f"  Confirm — type the tenant name exactly ('{name}'): ",
+                 NO_TTY_TENANT).strip()
+    if second != name:
+        sys.exit(f"Aborted: '{second}' does not match '{name}'.")
+
+
+def select_tenant(args):
+    """Resolve which saved tenant to use, or None to fall back to env/prompt."""
+    doc = load_tenant_store()
+    tenants = doc.get("tenants") or []
+    wanted = getattr(args, "tenant", None)
+
+    if wanted:
+        t = find_tenant(doc, wanted)
+        if not t:
+            names = ", ".join(str(x.get("name")) for x in tenants) or "none"
+            sys.exit(f"ERROR: no saved tenant named '{wanted}'. "
+                     f"Configured: {names}\n"
+                     "Add one with:  zpa_segment_connectivity.py tenants add")
+        # --tenant is an explicit choice; --yes means the caller scripted it
+        if not args.yes:
+            confirm_tenant_choice(t)
+        return t
+
+    if not tenants:
+        return None
+
+    print("\nSaved tenants:")
+    for i, t in enumerate(tenants, 1):
+        print(f"  [{i}] " + _describe_tenant(t).replace("\n", "\n      "))
+    print(f"  [0] none of these — enter credentials manually")
+    while True:
+        raw = ask(f"Select tenant [0-{len(tenants)}]: ",
+                  NO_TTY_TENANT).strip()
+        if raw == "0":
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= len(tenants):
+            chosen = tenants[int(raw) - 1]
+            break
+        named = find_tenant(doc, raw)
+        if named:
+            chosen = named
+            break
+        print(f"  enter 0-{len(tenants)}, or a tenant name")
+    confirm_tenant_choice(chosen)
+    return chosen
+
+
+def apply_tenant(args, tenant):
+    """Tenant values fill only what an explicit flag has not already set."""
+    if not tenant:
+        return
+    for field in TENANT_FIELDS:
+        if not getattr(args, field, None):
+            setattr(args, field, tenant.get(field) or None)
+    if not getattr(args, "client_secret", None) and tenant.get("client_secret"):
+        args.client_secret = tenant["client_secret"]
+    args.tenant_name = tenant.get("name")
+
+
+def run_tenants(args):
+    doc = load_tenant_store()
+    path = tenant_store_path()
+
+    if args.action == "list":
+        tenants = doc.get("tenants") or []
+        if not tenants:
+            print(f"No saved tenants ({path} does not exist yet).")
+            print("Add one with:  zpa_segment_connectivity.py tenants add")
+            return
+        print(f"Saved tenants ({path}):\n")
+        for i, t in enumerate(tenants, 1):
+            print(f"  [{i}] " + _describe_tenant(t).replace("\n", "\n      "))
+        print()
+        return
+
+    if args.action == "remove":
+        if not args.name:
+            sys.exit("ERROR: tenants remove requires a tenant name.")
+        t = find_tenant(doc, args.name)
+        if not t:
+            sys.exit(f"ERROR: no saved tenant named '{args.name}'.")
+        doc["tenants"] = [x for x in doc["tenants"] if x is not t]
+        save_tenant_store(doc)
+        print(f"Removed tenant '{t.get('name')}' from {path}")
+        return
+
+    # add
+    name = args.name or ask("  Tenant name (e.g. model, production): ",
+                            "ERROR: no terminal — pass a name: "
+                            "tenants add <name>").strip()
+    if not name:
+        sys.exit("ERROR: tenant name is required.")
+    existing = find_tenant(doc, name)
+    if existing and not args.force:
+        sys.exit(f"ERROR: tenant '{name}' already exists. Re-add with "
+                 "--force to overwrite, or pick another name.")
+
+    is_prod = ask(f"  Is '{name}' a PRODUCTION tenant? [y/N]: ",
+                  "ERROR: no terminal for tenant setup."
+                  ).strip().lower() in ("y", "yes")
+    client_id = ask("  OneAPI client ID: ", "ERROR: no terminal.").strip()
+    vanity = ask("  Zidentity vanity domain (the <name> in "
+                 "<name>.zslogin.net): ", "ERROR: no terminal.").strip()
+    customer = ask("  ZPA customer ID: ", "ERROR: no terminal.").strip()
+    if not all([client_id, vanity, customer]):
+        sys.exit("ERROR: client ID, vanity domain and customer ID are all "
+                 "required.")
+
+    print("\n  The client secret can be saved too, but it is stored in "
+          "PLAINTEXT in\n"
+          f"  {path} (permissions 0600). By default this tool never writes\n"
+          "  the secret to disk and prompts for it each run instead.")
+    save_secret = ask("  Save the client secret as well? [y/N]: ",
+                      "ERROR: no terminal.").strip().lower() in ("y", "yes")
+    secret = ""
+    if save_secret:
+        secret = getpass.getpass("  OneAPI client secret (hidden): ").strip()
+        if not secret:
+            print("  [!] Empty secret — not saving it; you will be prompted "
+                  "each run.")
+
+    entry = {"name": name, "production": is_prod, "client_id": client_id,
+             "vanity_domain": vanity, "customer_id": customer}
+    if secret:
+        entry["client_secret"] = secret
+
+    doc.setdefault("tenants", [])
+    doc["tenants"] = [x for x in doc["tenants"] if x is not existing]
+    doc["tenants"].append(entry)
+    save_tenant_store(doc)
+    print(f"\nSaved tenant '{name}' to {path} (mode 0600)"
+          + ("  [secret stored]" if secret else "  [secret not stored]"))
+    if is_prod:
+        print("Marked PRODUCTION — selecting it will require confirming "
+              "twice.")
+
+
 def gather_credentials(args):
     """Resolve OneAPI credentials: command-line flag > env var > interactive
     prompt. Lets an end user run the tool with zero environment setup — they
@@ -334,6 +585,11 @@ def gather_credentials(args):
         if not val:
             sys.exit(f"ERROR: {label} is required.")
         return val
+
+    # A saved tenant fills in whatever an explicit flag has not already set,
+    # and still leaves env vars and the prompt as fallbacks below.
+    if not getattr(args, "tenant_name", None):
+        apply_tenant(args, select_tenant(args))
 
     need = not all([
         args.client_id or os.environ.get("ZSCALER_CLIENT_ID"),
@@ -2181,6 +2437,10 @@ def run_verify_sipa(args):
 # --------------------------------------------------------------------------
 
 def add_api_args(p):
+    p.add_argument("--tenant", metavar="NAME",
+                   help="use a saved tenant (see the 'tenants' subcommand). "
+                        "Without it, saved tenants are offered interactively; "
+                        "selection is confirmed twice")
     p.add_argument("--client-id", help="OneAPI client ID "
                    "(or env ZSCALER_CLIENT_ID)")
     p.add_argument("--vanity-domain", help="Zidentity vanity domain "
@@ -2224,6 +2484,29 @@ def main():
     pf.add_argument("--output-dir", default="zpa-test-results")
     add_api_args(pf)
     pf.set_defaults(func=run_preflight)
+
+    # -- tenants -----------------------------------------------------------
+    tn = sub.add_parser(
+        "tenants",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        help="save and select ZPA tenants (e.g. model and production)",
+        epilog="Saves the OneAPI values per tenant so a pilot spanning a "
+               "model and a production tenant does not mean retyping four "
+               "values per run.\n\n"
+               "The store lives at ~/.zpa-connectivity-tester/tenants.json "
+               "(mode 0600; override with $ZPA_TENANT_STORE).\n"
+               "The client secret is only written if you opt in — by default "
+               "it is prompted each run and never touches disk.\n\n"
+               "  tenants add [name]     save a tenant interactively\n"
+               "  tenants list           show saved tenants\n"
+               "  tenants remove NAME    delete one\n\n"
+               "Selecting a tenant for a run is confirmed twice, and the "
+               "second confirmation requires typing the tenant name.")
+    tn.add_argument("action", choices=["add", "list", "remove"])
+    tn.add_argument("name", nargs="?", help="tenant name (add/remove)")
+    tn.add_argument("--force", action="store_true",
+                    help="overwrite an existing tenant of the same name")
+    tn.set_defaults(func=run_tenants)
 
     # -- export-targets ----------------------------------------------------
     ex = sub.add_parser("export-targets",

@@ -4,7 +4,7 @@ Admin tool for validating reachability to ZPA application segments from an
 endpoint running Zscaler Client Connector. Run it before ZPA is enabled for
 an account, again after, then diff the two runs.
 
-- Script: `zpa_segment_connectivity.py` (v1.3.1)
+- Script: `zpa_segment_connectivity.py` (v1.4.0)
 - Python 3.9+, standard library only — **no `pip install`**
 - Windows / macOS / Linux. Read-only against the ZPA API (GET).
 - **Runs entirely on your own machine.** Nothing is installed or sent
@@ -35,6 +35,56 @@ your shell history, or the command line.
 > environment variables (`ZSCALER_CLIENT_ID`, `ZSCALER_VANITY_DOMAIN`,
 > `ZPA_CUSTOMER_ID`, `ZSCALER_CLIENT_SECRET`) to skip the prompts.
 > PowerShell: `$env:ZSCALER_CLIENT_ID = "..."`.
+
+### Saving tenants (model vs production)
+
+A pilot usually spans two tenants — a model/test one and production. Save
+each once instead of retyping four values per run:
+
+```
+python3 zpa_segment_connectivity.py tenants add model
+python3 zpa_segment_connectivity.py tenants add production
+python3 zpa_segment_connectivity.py tenants list
+```
+
+`tenants add` asks whether the tenant is **production**, then for the client
+ID, vanity domain and customer ID. The store is
+`~/.zpa-connectivity-tester/tenants.json`, created mode `0600` (override the
+location with `$ZPA_TENANT_STORE`).
+
+> The client secret is **only** saved if you opt in, and it is stored in
+> plaintext. The default is to prompt for it each run so it never touches
+> disk — keep that default unless you have a reason not to.
+
+Any run that needs credentials then offers the saved tenants:
+
+```
+Saved tenants:
+  [1] model
+        vanity domain : acme-model
+        ...
+  [2] production  ** PRODUCTION **
+        ...
+  [0] none of these — enter credentials manually
+Select tenant [0-2]: 2
+
+  Selected PRODUCTION tenant:
+    ...
+  Run against 'production'? [y/N]: y
+  Confirm — type the tenant name exactly ('production'): production
+```
+
+**Selection is confirmed twice**, and the second confirmation requires
+typing the tenant name — a second yes/no gets answered reflexively, and the
+mistake being guarded against is sweeping production while believing you are
+on the model tenant. Typing anything else aborts.
+
+Skip the menu with `--tenant NAME` (still confirmed twice), or
+`--tenant NAME --yes` for scripted runs where the choice is already
+explicit. Values from `--client-id`/`--vanity-domain`/`--customer-id` always
+win over the saved tenant; env vars still work as before.
+
+Remove one with `tenants remove NAME`.
 
 **Check readiness** — verifies Python, output folder, ZCC presence, and DNS
 without probing or authenticating:
