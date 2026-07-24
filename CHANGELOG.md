@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.2.3
+- **Fixed a crash when `--targets-file` points at a missing file.** The
+  preflight check flags it, but that failure is overridable (the prompt, or
+  `--yes`), so the run continued and died with a raw `FileNotFoundError`
+  traceback inside `load_segments`. It now exits with the reason and the
+  `export-targets` command that creates the file. Unreadable and malformed
+  targets files exit cleanly too.
+
 ## v1.2.2
 Bug-fix release. Validated 105/105 (unit) and 28/28 (end-to-end CLI) on
 Linux, macOS (Python 3.9), and Windows 11 (Python 3.14).

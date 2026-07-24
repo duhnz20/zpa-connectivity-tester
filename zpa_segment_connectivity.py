@@ -80,7 +80,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-SCRIPT_VERSION = "1.2.2"
+SCRIPT_VERSION = "1.2.3"
 DEFAULT_API_BASE = "https://api.zsapi.net"
 OAUTH_AUDIENCE = "https://api.zscaler.com"
 ZPA_SYNTHETIC_NET = ipaddress.ip_network("100.64.0.0/10")
@@ -430,8 +430,25 @@ def load_segments(args):
     """Segments from a frozen targets file, or live from the API."""
     if getattr(args, "targets_file", None):
         path = os.path.abspath(args.targets_file)
-        with open(args.targets_file, encoding="utf-8-sig") as f:
-            doc = json.load(f)
+        prog = os.path.basename(sys.argv[0]) or "zpa_segment_connectivity.py"
+        # Reachable even when preflight already flagged the file: preflight
+        # failures are overridable (prompt or --yes), so this must fail with
+        # a usable message rather than a traceback.
+        try:
+            with open(args.targets_file, encoding="utf-8-sig") as f:
+                doc = json.load(f)
+        except FileNotFoundError:
+            sys.exit(
+                f"ERROR: targets file not found: {path}\n"
+                "Create it first, then re-run this command:\n"
+                f"    python3 {prog} export-targets --out {args.targets_file}\n"
+                "Or drop --targets-file to pull the inventory live from the "
+                "API (you will be prompted for credentials).")
+        except OSError as e:
+            sys.exit(f"ERROR: cannot read targets file {path}: {e}")
+        except ValueError as e:
+            sys.exit(f"ERROR: {path} is not valid JSON: {e}\n"
+                     "Re-create it with export-targets.")
         # Accept both the export-targets envelope and a bare segment array;
         # a list has no .get(), so the shape must be tested before reading.
         if isinstance(doc, list):

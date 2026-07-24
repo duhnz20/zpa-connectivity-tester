@@ -297,6 +297,36 @@ def main():
         segs2, _ = m.load_segments(Args(targets_file=p_env))
         check("envelope targets file still loads", len(segs2) == 1)
 
+        # regression: a MISSING targets file must exit with guidance, not a
+        # FileNotFoundError traceback. Reachable in normal use because a
+        # failed preflight is overridable via the prompt or --yes.
+        try:
+            m.load_segments(Args(targets_file=os.path.join(_tdir, "nope.json")))
+            check("missing targets file exits cleanly", False, "no exit")
+        except SystemExit as e:
+            msg = str(e.code)
+            check("missing targets file exits cleanly", True)
+            check("missing-targets error names export-targets as the fix",
+                  "export-targets" in msg, msg.splitlines()[0][:60])
+        except FileNotFoundError:
+            check("missing targets file exits cleanly", False,
+                  "raised FileNotFoundError traceback")
+
+        # unreadable file (permission denied) must also be clean
+        p_noperm = os.path.join(_tdir, "noperm.json")
+        with open(p_noperm, "w", encoding="utf-8") as f:
+            json.dump(seg_min, f)
+        try:
+            os.chmod(p_noperm, 0)
+            m.load_segments(Args(targets_file=p_noperm))
+            check("unreadable targets file exits cleanly", False, "no exit")
+        except SystemExit:
+            check("unreadable targets file exits cleanly", True)
+        except OSError:
+            check("unreadable targets file exits cleanly", False, "raised OSError")
+        finally:
+            os.chmod(p_noperm, 0o644)
+
         # a JSON scalar is neither shape -> clean exit, not a traceback
         p_bad = os.path.join(_tdir, "bad.json")
         with open(p_bad, "w", encoding="utf-8") as f:
