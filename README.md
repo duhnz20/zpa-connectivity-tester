@@ -4,7 +4,7 @@ Admin tool for validating reachability to ZPA application segments from an
 endpoint running Zscaler Client Connector. Run it before ZPA is enabled for
 an account, again after, then diff the two runs.
 
-- Script: `zpa_segment_connectivity.py` (v1.4.0)
+- Script: `zpa_segment_connectivity.py` (v1.4.1)
 - Python 3.9+, standard library only — **no `pip install`**
 - Windows / macOS / Linux. Read-only against the ZPA API (GET).
 - **Runs entirely on your own machine.** Nothing is installed or sent
@@ -71,15 +71,19 @@ Select tenant [0-2]: 2
   Selected PRODUCTION tenant:
     ...
   Run against 'production'? [y/N]: y
-  Confirm — type the tenant name exactly ('production'): production
+  PRODUCTION — confirm by typing the tenant name exactly ('production'): production
 ```
 
-**Selection is confirmed twice**, and the second confirmation requires
-typing the tenant name — a second yes/no gets answered reflexively, and the
-mistake being guarded against is sweeping production while believing you are
-on the model tenant. Typing anything else aborts.
+**Production tenants are confirmed twice**, and the second confirmation
+requires typing the tenant name — a second yes/no gets answered reflexively,
+and the mistake being guarded against is sweeping production while believing
+you are on the model tenant. Typing anything else aborts.
 
-Skip the menu with `--tenant NAME` (still confirmed twice), or
+Non-production tenants take a single `y/N`. That asymmetry is deliberate:
+demanding the same friction everywhere trains people to type through it,
+which would weaken the prompt exactly where it matters.
+
+Skip the menu with `--tenant NAME` (production still confirmed twice), or
 `--tenant NAME --yes` for scripted runs where the choice is already
 explicit. Values from `--client-id`/`--vanity-domain`/`--customer-id` always
 win over the saved tenant; env vars still work as before.

@@ -80,7 +80,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-SCRIPT_VERSION = "1.4.0"
+SCRIPT_VERSION = "1.4.1"
 DEFAULT_API_BASE = "https://api.zsapi.net"
 OAUTH_AUDIENCE = "https://api.zscaler.com"
 ZPA_SYNTHETIC_NET = ipaddress.ip_network("100.64.0.0/10")
@@ -407,24 +407,28 @@ def _describe_tenant(t):
 
 
 def confirm_tenant_choice(t):
-    """Two independent confirmations before a tenant is used.
+    """Confirm before a tenant is used; production demands more.
 
-    The second requires typing the tenant name rather than another y/N:
-    a second yes/no is answered reflexively, and the failure being guarded
-    against is running a probe sweep against production while believing it
-    is the model tenant.
+    Production requires a second confirmation that types the tenant name,
+    because a second yes/no gets answered reflexively and the failure being
+    guarded against is sweeping production while believing it is the model
+    tenant. Non-production is a single y/N on purpose: applying the same
+    friction everywhere just trains people to type through it, which would
+    weaken the prompt where it actually matters.
     """
     name = str(t.get("name", ""))
-    kind = ("PRODUCTION tenant" if t.get("production")
-            else "non-production tenant")
+    is_prod = bool(t.get("production"))
+    kind = "PRODUCTION tenant" if is_prod else "non-production tenant"
     print(f"\n  Selected {kind}:")
     print("    " + _describe_tenant(t).replace("\n", "\n    "))
     first = ask(f"\n  Run against '{name}'? [y/N]: ",
                 NO_TTY_TENANT).strip().lower()
     if first not in ("y", "yes"):
         sys.exit("Aborted.")
-    second = ask(f"  Confirm — type the tenant name exactly ('{name}'): ",
-                 NO_TTY_TENANT).strip()
+    if not is_prod:
+        return
+    second = ask(f"  PRODUCTION — confirm by typing the tenant name exactly "
+                 f"('{name}'): ", NO_TTY_TENANT).strip()
     if second != name:
         sys.exit(f"Aborted: '{second}' does not match '{name}'.")
 

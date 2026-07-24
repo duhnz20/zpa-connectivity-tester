@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.4.1
+Validated 184/184 on Linux and macOS, 183/183 on Windows 11.
+
+- **The name-typing confirmation is now scoped to production tenants.**
+  Non-production selection is a single `y/N`. Requiring the same friction
+  everywhere trains people to type through it, which weakens the prompt
+  exactly where it matters; production still requires typing the tenant
+  name and still rejects a second bare `y`.
+
 ## v1.4.0
 Saved tenants. Validated 178/178 on Linux and macOS, 177/177 on Windows 11
 (one assertion is POSIX-only).

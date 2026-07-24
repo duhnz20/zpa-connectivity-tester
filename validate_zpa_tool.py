@@ -462,41 +462,69 @@ def main():
         check("saved secret is applied when present",
               a2.client_secret == "s3cret")
 
-        # --- the double confirmation ---
-        answers = []
-        m.ask = lambda prompt, msg: answers.pop(0)
-        prod = m.find_tenant(doc, "production")
+        # --- confirmation: name-typing is scoped to PRODUCTION only ---
+        answers, asked = [], []
 
-        answers[:] = ["y", "production"]
+        def _fake_ask(prompt, msg):
+            asked.append(prompt)
+            return answers.pop(0)
+        m.ask = _fake_ask
+        prod = m.find_tenant(doc, "production")
+        model = m.find_tenant(doc, "model")
+
+        answers[:] = ["y", "production"]; asked[:] = []
         try:
             m.confirm_tenant_choice(prod)
-            check("correct name at the 2nd prompt proceeds", True)
+            check("production: correct name at the 2nd prompt proceeds", True)
         except SystemExit as e:
-            check("correct name at the 2nd prompt proceeds", False, str(e.code))
+            check("production: correct name at the 2nd prompt proceeds",
+                  False, str(e.code))
+        check("production asks twice", len(asked) == 2, f"{len(asked)} prompts")
 
         answers[:] = ["y", "model"]
         try:
             m.confirm_tenant_choice(prod)
-            check("wrong name at the 2nd prompt aborts", False, "proceeded")
+            check("production: wrong name aborts", False, "proceeded")
         except SystemExit as e:
-            check("wrong name at the 2nd prompt aborts", True)
+            check("production: wrong name aborts", True)
             check("abort message names both values",
                   "model" in str(e.code) and "production" in str(e.code))
+
+        answers[:] = ["y", "y"]
+        try:
+            m.confirm_tenant_choice(prod)
+            check("production: a second bare 'y' is not accepted", False,
+                  "proceeded")
+        except SystemExit:
+            check("production: a second bare 'y' is not accepted", True)
 
         answers[:] = ["n"]
         try:
             m.confirm_tenant_choice(prod)
-            check("declining the 1st prompt aborts", False, "proceeded")
+            check("production: declining the 1st prompt aborts", False,
+                  "proceeded")
         except SystemExit:
-            check("declining the 1st prompt aborts", True)
+            check("production: declining the 1st prompt aborts", True)
 
-        # a bare "y" twice must NOT be enough for the name prompt
-        answers[:] = ["y", "y"]
+        # non-production is a single y/N — the same friction everywhere just
+        # trains people to type through it
+        answers[:] = ["y"]; asked[:] = []
         try:
-            m.confirm_tenant_choice(prod)
-            check("a second bare 'y' is not accepted", False, "proceeded")
+            m.confirm_tenant_choice(model)
+            check("non-production: a single 'y' proceeds", True)
+        except SystemExit as e:
+            check("non-production: a single 'y' proceeds", False, str(e.code))
+        check("non-production asks exactly once", len(asked) == 1,
+              f"{len(asked)} prompts")
+        check("non-production prompt does not demand the name",
+              "typing the tenant name" not in "".join(asked))
+
+        answers[:] = ["n"]
+        try:
+            m.confirm_tenant_choice(model)
+            check("non-production: 'n' still aborts", False, "proceeded")
         except SystemExit:
-            check("a second bare 'y' is not accepted", True)
+            check("non-production: 'n' still aborts", True)
 
         # --tenant NAME resolution
         answers[:] = ["y", "production"]
@@ -520,10 +548,13 @@ def main():
         answers[:] = ["0"]
         check("choice 0 opts out to manual credential entry",
               m.select_tenant(Args(tenant=None, yes=False)) is None)
-        answers[:] = ["model", "y", "model"]
+        # non-production needs only the single y/N, so two answers suffice
+        answers[:] = ["model", "y"]
         sel = m.select_tenant(Args(tenant=None, yes=False))
         check("tenant can be chosen by name at the menu",
               sel["client_id"] == "mid")
+        check("no leftover answers — non-production consumed exactly one "
+              "confirmation", not answers, str(answers))
 
         # an empty store must fall through to env/prompt, not show a menu
         _empty_dir = tempfile.mkdtemp(prefix="zpa-empty-")
