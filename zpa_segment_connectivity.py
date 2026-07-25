@@ -46,13 +46,14 @@ TCP connect (optionally TLS/HTTP) from the local machine.
 Interpreting results — two caveats that follow from how Client Connector
 implements ZPA steering:
 
-  1. ZPA steering is FQDN-driven: Client Connector holds a local app-list
-     of names, and a match yields a synthetic 100.64.x.x (RFC 6598)
-     address. IP- and CIDR-defined entries produce no synthetic IP, so
-     `zpa_intercepted` is N/A for them — and a successful post-run connect
-     to an IP/CIDR entry does NOT by itself prove the traffic went through
-     ZPA rather than direct. Confirm those segments from the ZPA admin
-     portal's access logs, not from this script alone.
+  1. ZPA steering is FQDN-driven: Client Connector holds a
+     local app-list of names, and a match yields an address inside the
+     tenant's synthetic range (Zscaler's default is 100.64.0.0/10, but it
+     is configurable and often narrowed — set --synthetic-net). IP- and CIDR-defined entries produce no synthetic
+     IP, so `zpa_intercepted` is N/A for them — and a successful post-run
+     connect to an IP/CIDR entry does NOT by itself prove the traffic went
+     through ZPA rather than direct. Confirm those segments from the ZPA
+     admin portal's access logs, not from this script alone.
   2. Negative DNS cache entries created during the pre run can persist and
      mask steering in the post run. Use --flush-dns on post runs; if an
      enrolled domain still fails to resolve, restart ZCC before treating
@@ -80,10 +81,43 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-SCRIPT_VERSION = "1.5.0"
+SCRIPT_VERSION = "1.6.0"
 DEFAULT_API_BASE = "https://api.zsapi.net"
 OAUTH_AUDIENCE = "https://api.zscaler.com"
-ZPA_SYNTHETIC_NET = ipaddress.ip_network("100.64.0.0/10")
+# Zscaler's documented default synthetic range. It is TENANT-CONFIGURABLE:
+# deployments commonly narrow it (e.g. 100.64.0.0/16), so this is only a
+# fallback — set --synthetic-net, or store it per tenant.
+#
+# Getting this wrong is not cosmetic. 100.64.0.0/10 is the RFC 6598
+# carrier-grade NAT range, so on a hotel or mobile network an ISP-assigned
+# CGNAT address falls inside the default and would be reported as
+# ZPA-steered — a false "ZPA IS STEERING" verdict, which is the headline
+# conclusion of the whole run.
+DEFAULT_SYNTHETIC_NET = "100.64.0.0/10"
+ZPA_SYNTHETIC_NET = ipaddress.ip_network(DEFAULT_SYNTHETIC_NET)
+
+
+def parse_synthetic_net(value):
+    """Validate a synthetic-range CIDR, or exit with a usable message."""
+    try:
+        net = ipaddress.ip_network(str(value), strict=False)
+    except ValueError as e:
+        sys.exit(f"ERROR: --synthetic-net {value!r} is not a valid CIDR: {e}")
+    if net.version != 4:
+        sys.exit("ERROR: --synthetic-net must be IPv4; ZPA synthetic "
+                 "addresses are IPv4.")
+    return net
+
+
+def synthetic_net_for(args):
+    """The tenant's synthetic range, resolved once and cached on args."""
+    cached = getattr(args, "synthetic_net_resolved", None)
+    if cached is not None:
+        return cached
+    raw = getattr(args, "synthetic_net", None) or DEFAULT_SYNTHETIC_NET
+    net = parse_synthetic_net(raw)
+    args.synthetic_net_resolved = net
+    return net
 PAGE_SIZE = 500
 FULL_CIDR_HOST_CAP = 65536   # hard memory guard even in full scope
 CONFIRM_THRESHOLD = 2000     # confirm before runs bigger than this
@@ -190,6 +224,18 @@ def preflight_checks(args, need_api=True, need_targets_file=None):
         checks.append(("Output folder writable", True, out_dir))
     except OSError as e:
         checks.append(("Output folder writable", False, f"{out_dir}: {e}"))
+
+    # State the range explicitly. Two reasons: it is the setting most likely
+    # to be wrong (it is tenant-specific and the default is 64x wider than a
+    # common /16), and parsing it here rejects an invalid value on EVERY
+    # subcommand rather than only where it happens to be used.
+    _net = synthetic_net_for(args)
+    checks.append((
+        "ZPA synthetic range", True,
+        f"{_net} ({_net.num_addresses:,} addresses)"
+        + ("  — Zscaler's default; set --synthetic-net if your tenant "
+           "narrows it" if str(_net) == DEFAULT_SYNTHETIC_NET else
+           "  — tenant-specific")))
 
     zcc = detect_zcc()
     checks.append(("Zscaler Client Connector",
@@ -326,7 +372,8 @@ def http_json(url, ctx, headers=None, data=None, timeout=30, retries=4):
 
 TENANT_STORE_ENV = "ZPA_TENANT_STORE"
 DEFAULT_TENANT_DIR = "~/.zpa-connectivity-tester"
-TENANT_FIELDS = ("client_id", "vanity_domain", "customer_id")
+TENANT_FIELDS = ("client_id", "vanity_domain", "customer_id",
+                 "synthetic_net")
 
 NO_TTY_TENANT = ("ERROR: no interactive terminal to choose a tenant — pass "
                  "--tenant NAME (with --yes to skip confirmation).")
@@ -403,6 +450,8 @@ def _describe_tenant(t):
             f"        vanity domain : {t.get('vanity_domain', '?')}\n"
             f"        customer id   : {t.get('customer_id', '?')}\n"
             f"        client id     : {t.get('client_id', '?')}\n"
+            f"        synthetic net : "
+            f"{t.get('synthetic_net') or DEFAULT_SYNTHETIC_NET}\n"
             f"        {secret}")
 
 
@@ -446,8 +495,11 @@ def select_tenant(args):
             sys.exit(f"ERROR: no saved tenant named '{wanted}'. "
                      f"Configured: {names}\n"
                      "Add one with:  zpa_segment_connectivity.py tenants add")
-        # --tenant is an explicit choice; --yes means the caller scripted it
-        if not args.yes:
+        # --tenant is an explicit choice; --yes means the caller scripted it.
+        # getattr, not args.yes: only `test` defines --yes, so a bare
+        # attribute access raised AttributeError on export-targets and
+        # sipa-verify — the very commands --tenant exists to serve.
+        if not getattr(args, "yes", False):
             confirm_tenant_choice(t)
         return t
 
@@ -532,6 +584,9 @@ def run_tenants(args):
     vanity = ask("  Zidentity vanity domain (the <name> in "
                  "<name>.zslogin.net): ", "ERROR: no terminal.").strip()
     customer = ask("  ZPA customer ID: ", "ERROR: no terminal.").strip()
+    synth_in = ask(f"  ZCC synthetic IP range [{DEFAULT_SYNTHETIC_NET}]: ",
+                   "ERROR: no terminal.").strip() or DEFAULT_SYNTHETIC_NET
+    parse_synthetic_net(synth_in)      # validate before it reaches the store
     if not all([client_id, vanity, customer]):
         sys.exit("ERROR: client ID, vanity domain and customer ID are all "
                  "required.")
@@ -550,7 +605,8 @@ def run_tenants(args):
                   "each run.")
 
     entry = {"name": name, "production": is_prod, "client_id": client_id,
-             "vanity_domain": vanity, "customer_id": customer}
+             "vanity_domain": vanity, "customer_id": customer,
+             "synthetic_net": synth_in}
     if secret:
         entry["client_secret"] = secret
 
@@ -1185,7 +1241,7 @@ def resolve_target(target, args):
         return {"ip": "", "intercepted": "", "sni": target["probe_domain"],
                 "dns_err": dns_err}
     try:
-        intercepted = ipaddress.ip_address(ip) in ZPA_SYNTHETIC_NET
+        intercepted = ipaddress.ip_address(ip) in synthetic_net_for(args)
     except ValueError:
         intercepted = ""
     return {"ip": ip, "intercepted": intercepted,
@@ -1419,7 +1475,7 @@ def classify_failure(status):
     return "OTHER"
 
 
-def run_verdict(args, intercepted, zcc):
+def run_verdict(args, intercepted, zcc, net=None):
     """One-line answer to the question the run exists to settle.
 
     The pre-phase branch matters: running --phase pre on a laptop that is
@@ -1436,7 +1492,8 @@ def run_verdict(args, intercepted, zcc):
                 "no synthetic IPs, as expected before ZPA is enabled")
     if n:
         return ("ZPA IS STEERING",
-                f"{n} domain(s) resolved into 100.64.0.0/10")
+                f"{n} domain(s) resolved into "
+                f"{net or ZPA_SYNTHETIC_NET}")
     if zcc.get("state") != "running":
         return ("NO STEERING OBSERVED",
                 "no synthetic IPs, and ZCC was not detected running")
@@ -1710,7 +1767,8 @@ def run_test(args):
     # ZCC is actively steering these segments into ZPA.
     zpa_evidence = ("synthetic IPs observed" if intercepted
                     else "no synthetic IPs observed")
-    verdict_label, verdict_detail = run_verdict(args, intercepted, zcc)
+    synth = synthetic_net_for(args)
+    verdict_label, verdict_detail = run_verdict(args, intercepted, zcc, synth)
     lat = latency_stats(all_rows)
 
     meta = {
@@ -1733,6 +1791,7 @@ def run_test(args):
                      "retries": args.retries, "l7": args.l7,
                      "timeout_s": args.timeout, "workers": args.workers},
         "zcc": zcc,
+        "synthetic_net": str(synth),
         "dns_cache_flush": dns_flush,
         "zpa_evidence": zpa_evidence,
         "verdict": verdict_label,
@@ -2645,6 +2704,12 @@ def add_api_args(p):
                    help="use a saved tenant (see the 'tenants' subcommand). "
                         "Without it, saved tenants are offered interactively; "
                         "selection is confirmed twice")
+    p.add_argument("--synthetic-net", metavar="CIDR",
+                   help="ZCC synthetic IP range for this tenant (default "
+                        f"{DEFAULT_SYNTHETIC_NET}). This is tenant-"
+                        "configurable and commonly narrowed, e.g. "
+                        "100.64.0.0/16. Too wide a range reports CGNAT "
+                        "addresses as ZPA-steered")
     p.add_argument("--client-id", help="OneAPI client ID "
                    "(or env ZSCALER_CLIENT_ID)")
     p.add_argument("--vanity-domain", help="Zidentity vanity domain "

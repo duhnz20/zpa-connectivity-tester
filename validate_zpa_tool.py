@@ -534,6 +534,21 @@ def main():
         sel = m.select_tenant(Args(tenant="model", yes=True))
         check("--tenant with --yes skips confirmation (scripted intent)",
               sel["client_id"] == "mid")
+        # regression: only `test` defines --yes, so select_tenant reading
+        # args.yes directly raised AttributeError on export-targets and
+        # sipa-verify — exactly the commands --tenant exists to serve
+        class _NoYes:
+            tenant = "model"
+        _ny = _NoYes()
+        answers[:] = ["y"]
+        try:
+            sel = m.select_tenant(_ny)
+            check("--tenant works on a subcommand without --yes",
+                  sel is not None and sel.get("client_id") == "mid")
+        except AttributeError as e:
+            check("--tenant works on a subcommand without --yes", False,
+                  f"AttributeError: {e}")
+
         try:
             m.select_tenant(Args(tenant="staging", yes=True))
             check("unknown --tenant exits", False, "no exit")
@@ -573,6 +588,46 @@ def main():
         else:
             os.environ["ZPA_TENANT_STORE"] = _prev_store
         shutil.rmtree(os.path.dirname(_tstore), ignore_errors=True)
+
+    print("\nSynthetic IP range (tenant-configurable)")
+    # 100.64.0.0/10 is the RFC 6598 CGNAT range. A tenant that narrows its
+    # synthetic range and a tool that assumes /10 disagree over 4.1M
+    # addresses — and on a CGNAT network (hotel, mobile hotspot) an
+    # ISP-assigned address inside /10 would be reported as ZPA-steered,
+    # producing a false "ZPA IS STEERING" verdict.
+    import ipaddress as _ip
+    check("default matches Zscaler's documented range",
+          m.DEFAULT_SYNTHETIC_NET == "100.64.0.0/10")
+
+    class _N:
+        def __init__(self, v=None):
+            self.synthetic_net = v
+
+    d10 = m.synthetic_net_for(_N())
+    d16 = m.synthetic_net_for(_N("100.64.0.0/16"))
+    check("default resolves to /10", str(d10) == "100.64.0.0/10")
+    check("tenant override resolves to /16", str(d16) == "100.64.0.0/16")
+    check("a CGNAT address inside /10 is NOT steered under a /16 tenant",
+          _ip.ip_address("100.90.4.7") in d10
+          and _ip.ip_address("100.90.4.7") not in d16)
+    check("an address inside the narrowed range is still steered",
+          _ip.ip_address("100.64.0.5") in d16)
+    _a = _N("100.64.0.0/16")
+    _first = m.synthetic_net_for(_a)
+    check("resolution is cached on args", m.synthetic_net_for(_a) is _first)
+    for bad in ("not-a-cidr", "999.0.0.0/8", "::1/128"):
+        try:
+            m.parse_synthetic_net(bad)
+            check(f"invalid range {bad!r} rejected", False, "accepted")
+        except SystemExit as e:
+            check(f"invalid range {bad!r} rejected", True,
+                  str(e.code).splitlines()[0][:44])
+    v, det = m.run_verdict(Args(phase="post"), {"a.corp"},
+                           {"state": "running"}, d16)
+    check("verdict names the tenant's range, not the default",
+          "100.64.0.0/16" in det and "100.64.0.0/10" not in det, det[:70])
+    check("synthetic_net is a stored tenant field",
+          "synthetic_net" in m.TENANT_FIELDS)
 
     print("\nRun-size safety ceiling")
     # Real numbers from a --scope full run against a 22-segment tenant:

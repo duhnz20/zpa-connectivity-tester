@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.6.0
+The ZCC synthetic IP range is now configurable. Validated 207/207 unit and
+52/52 end-to-end on macOS; unit suite also green on Linux and Windows 11.
+
+- **`--synthetic-net CIDR`, and a per-tenant `synthetic_net` field.** The
+  range was hardcoded to Zscaler's documented default `100.64.0.0/10`, but
+  it is tenant-configurable and commonly narrowed (e.g. `100.64.0.0/16`).
+- **This was a correctness bug, not a missing setting.** `100.64.0.0/10` is
+  the RFC 6598 carrier-grade NAT range. Against a `/16` tenant the assumed
+  range is 64x too wide, leaving 4.1M addresses the tool would report as
+  ZPA-steered that the tenant never issues — and on a CGNAT network (hotel
+  Wi-Fi, mobile hotspot) an ISP-assigned address falls in exactly that gap,
+  producing a false `ZPA IS STEERING` verdict.
+- **Preflight states the range** and flags when it is still the default, so
+  a misconfiguration is visible before probing rather than never.
+- **Fixed: `--tenant` crashed on `export-targets` and `sipa-verify`.**
+  `select_tenant()` read `args.yes` directly, but only `test` defines
+  `--yes`, so both died with `AttributeError` — the exact commands
+  `--tenant` exists to serve.
+- Invalid or IPv6 ranges are rejected at startup on every subcommand.
+
 ## v1.5.0
 Port-level parallelism. Validated 195/195 on Linux and macOS, 194/194 on
 Windows 11.
@@ -8,19 +29,13 @@ Windows 11.
   submitted one task per *target* and walked that target's ports serially,
   so concurrency was capped by target count rather than probe count — a
   50-target run could not beat `ports x timeout` no matter how many workers
-  were configured. Same 400-probe workload:
-
-  | `--workers` | before | after |
-  |---|---|---|
-  | 20  | 48.3s | 40.5s |
-  | 50  | 16.2s | 16.2s |
-  | 100 | 16.2s | 8.2s  |
-  | 200 | 16.2s | 4.2s  |
-
-- `run_test` runs two pooled phases: resolve each target once, then one task
-  per `(target, port)`. Deliberately a single flat pool — nesting a pool per
-  target would multiply to `workers x ports` and exhaust the process FD
-  limit (256 by default on macOS).
+  were configured. Same 400-probe workload, before vs after:
+  workers 20: 48.3s -> 40.5s; 50: 16.2s -> 16.2s; 100: 16.2s -> 8.2s;
+  200: 16.2s -> 4.2s.
+- `run_test` runs two pooled phases: resolve each target once, then one
+  task per `(target, port)`. Deliberately a single flat pool — nesting a
+  pool per target would multiply to `workers x ports` and exhaust the
+  process FD limit (256 by default on macOS).
 - Probes still connect **by hostname**, not the resolved IP. That looks
   redundant beside `resolved_ip`, but it is load-bearing: ZPA steering is
   FQDN-driven, so connecting to a resolved address would bypass Client
