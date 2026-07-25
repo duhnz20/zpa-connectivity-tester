@@ -939,14 +939,17 @@ def main():
 
         # regression: one raising worker used to discard every row collected
         # so far, because fut.result() was called outside a try
-        _orig_pt = m.probe_target
+        # patch probe_port, not probe_target: run_test now submits one pool
+        # task per (target, port), so patching the whole-target helper would
+        # leave this assertion testing nothing
+        _orig_pt = m.probe_port
         _seen = {"n": 0}
-        def exploding(t, a):
+        def exploding(t, p, r, a):
             _seen["n"] += 1
             if _seen["n"] == 1:
                 raise RuntimeError("simulated worker crash")
-            return _orig_pt(t, a)
-        m.probe_target = exploding
+            return _orig_pt(t, p, r, a)
+        m.probe_port = exploding
         try:
             ae = Args(targets_file=tf, output_dir=os.path.join(workdir, "oute"),
                       scope_resolved="sample", cidr_hosts=2)
@@ -966,7 +969,7 @@ def main():
                   meta_e["results"].get("worker_errors") == 1,
                   str(meta_e["results"].get("worker_errors")))
         finally:
-            m.probe_target = _orig_pt
+            m.probe_port = _orig_pt
 
         # compare/report must reject a CSV that is not ours, with a message
         notours = os.path.join(workdir, "notours.csv")

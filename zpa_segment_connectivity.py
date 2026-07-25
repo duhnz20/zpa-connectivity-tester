@@ -80,7 +80,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-SCRIPT_VERSION = "1.4.2"
+SCRIPT_VERSION = "1.5.0"
 DEFAULT_API_BASE = "https://api.zsapi.net"
 OAUTH_AUDIENCE = "https://api.zscaler.com"
 ZPA_SYNTHETIC_NET = ipaddress.ip_network("100.64.0.0/10")
@@ -1157,10 +1157,9 @@ def l7_probe(host, port, timeout, sni=None):
         return f"L7_ERROR:{getattr(e, 'strerror', None) or type(e).__name__}"
 
 
-def probe_target(target, args):
-    """Probe one target: DNS (FQDNs only), then each TCP port."""
-    rows = []
-    base = {
+def target_base(target):
+    """Row fields shared by every row this target produces."""
+    return {
         "segment": target["segment"],
         "enabled": target["enabled"],
         "ip_anchored": target["ip_anchored"],
@@ -1169,47 +1168,92 @@ def probe_target(target, args):
         "probe_domain": target["probe_domain"],
     }
 
-    if target["kind"] in ("ip", "cidr"):
-        ip, zpa_intercepted, sni = target["probe_domain"], "N/A", None
-    else:
-        ip, dns_err = resolve(target["probe_domain"], args.timeout)
-        sni = target["probe_domain"]
-        if dns_err:
-            rows.append({**base, "resolved_ip": "", "zpa_intercepted": "",
-                         "protocol": "dns", "port": "",
-                         "status": f"DNS_FAIL:{dns_err}", "attempts": 1,
-                         "latency_ms": "", "l7_result": ""})
-            return rows
-        try:
-            zpa_intercepted = ipaddress.ip_address(ip) in ZPA_SYNTHETIC_NET
-        except ValueError:
-            zpa_intercepted = ""
 
+def resolve_target(target, args):
+    """Resolve a target once. Ports reuse this rather than re-resolving.
+
+    Note this is resolution for *reporting* (resolved_ip, zpa_intercepted).
+    The probes themselves still connect by hostname — ZPA steering is
+    FQDN-driven, so connecting to the resolved IP would bypass Client
+    Connector's app-list matching and invalidate the result.
+    """
+    if target["kind"] in UNVERIFIABLE_KINDS:
+        return {"ip": target["probe_domain"], "intercepted": "N/A",
+                "sni": None, "dns_err": None}
+    ip, dns_err = resolve(target["probe_domain"], args.timeout)
+    if dns_err:
+        return {"ip": "", "intercepted": "", "sni": target["probe_domain"],
+                "dns_err": dns_err}
+    try:
+        intercepted = ipaddress.ip_address(ip) in ZPA_SYNTHETIC_NET
+    except ValueError:
+        intercepted = ""
+    return {"ip": ip, "intercepted": intercepted,
+            "sni": target["probe_domain"], "dns_err": None}
+
+
+def target_static_rows(target, res):
+    """Rows needing no TCP probe: DNS failure, no-ports, UDP listing."""
+    base = target_base(target)
+    if res["dns_err"]:
+        return [{**base, "resolved_ip": "", "zpa_intercepted": "",
+                 "protocol": "dns", "port": "",
+                 "status": f"DNS_FAIL:{res['dns_err']}", "attempts": 1,
+                 "latency_ms": "", "l7_result": ""}]
+    rows = []
     if not target["ports"]:
-        rows.append({**base, "resolved_ip": ip,
-                     "zpa_intercepted": zpa_intercepted,
+        rows.append({**base, "resolved_ip": res["ip"],
+                     "zpa_intercepted": res["intercepted"],
                      "protocol": "dns" if target["kind"] == "fqdn" else "tcp",
                      "port": "", "status": "NO_TCP_PORTS", "attempts": 0,
                      "latency_ms": "", "l7_result": ""})
-    for port in target["ports"]:
-        status, latency, attempts = tcp_probe_retry(
-            target["probe_domain"], port, args.timeout, args.retries)
-        l7 = ""
-        if args.l7 and status in ("OPEN", "OPEN_FLAKY"):
-            l7 = l7_probe(target["probe_domain"], port, args.timeout, sni)
-        rows.append({**base, "resolved_ip": ip,
-                     "zpa_intercepted": zpa_intercepted,
-                     "protocol": "tcp", "port": port,
-                     "status": status, "attempts": attempts,
-                     "latency_ms": latency if latency is not None else "",
-                     "l7_result": l7})
     for lo, hi in target["udp_ranges"]:
-        rows.append({**base, "resolved_ip": ip,
-                     "zpa_intercepted": zpa_intercepted,
+        rows.append({**base, "resolved_ip": res["ip"],
+                     "zpa_intercepted": res["intercepted"],
                      "protocol": "udp",
                      "port": f"{lo}-{hi}" if lo != hi else lo,
                      "status": "UDP_NOT_PROBED", "attempts": 0,
                      "latency_ms": "", "l7_result": ""})
+    return rows
+
+
+def probe_port(target, port, res, args):
+    """Probe a single (target, port) — the unit of concurrency.
+
+    Splitting this out is what lets a segment's ports run in parallel.
+    Previously one pool task handled a whole target and walked its ports
+    serially, so concurrency was capped by target count: a 50-target run
+    could not go faster than 8 ports x timeout no matter how many workers
+    were configured.
+    """
+    status, latency, attempts = tcp_probe_retry(
+        target["probe_domain"], port, args.timeout, args.retries)
+    l7 = ""
+    if args.l7 and status in OK_STATUSES:
+        l7 = l7_probe(target["probe_domain"], port, args.timeout, res["sni"])
+    return {**target_base(target), "resolved_ip": res["ip"],
+            "zpa_intercepted": res["intercepted"],
+            "protocol": "tcp", "port": port,
+            "status": status, "attempts": attempts,
+            "latency_ms": latency if latency is not None else "",
+            "l7_result": l7}
+
+
+def probe_error_row(target, exc):
+    """A failed work unit, recorded rather than lost to a traceback."""
+    return {**target_base(target), "resolved_ip": "", "zpa_intercepted": "",
+            "protocol": "", "port": "",
+            "status": f"PROBE_ERROR:{type(exc).__name__}",
+            "attempts": 0, "latency_ms": "", "l7_result": ""}
+
+
+def probe_target(target, args):
+    """Serial probe of one target — kept for callers that want it whole."""
+    res = resolve_target(target, args)
+    rows = target_static_rows(target, res)
+    if res["dns_err"]:
+        return rows
+    rows.extend(probe_port(target, p, res, args) for p in target["ports"])
     return rows
 
 
@@ -1573,32 +1617,51 @@ def run_test(args):
     socket.setdefaulttimeout(args.timeout)
     started = datetime.now(timezone.utc)
 
+    # Two pooled phases. Resolution happens once per target; probing is then
+    # one pool task per (target, port), so a segment's ports run in parallel.
+    # A single flat pool also keeps sockets bounded by --workers — nesting a
+    # pool inside each target would multiply into workers x ports and blow
+    # past the process FD limit (256 by default on macOS).
     all_rows, interrupted, worker_errors = [], False, 0
     pool = concurrent.futures.ThreadPoolExecutor(args.workers)
     try:
-        futures = {pool.submit(probe_target, t, args): t for t in targets}
-        done = 0
+        res_futs = {pool.submit(resolve_target, t, args): i
+                    for i, t in enumerate(targets)}
+        resolutions = {}
+        for fut in concurrent.futures.as_completed(res_futs):
+            i = res_futs[fut]
+            try:
+                resolutions[i] = fut.result()
+            except Exception as e:
+                worker_errors += 1
+                all_rows.append(probe_error_row(targets[i], e))
+
+        units = []
+        for i, t in enumerate(targets):
+            res = resolutions.get(i)
+            if res is None:
+                continue
+            all_rows.extend(target_static_rows(t, res))
+            if res["dns_err"]:
+                continue
+            units.extend((t, p, res) for p in t["ports"])
+
+        print(f"    resolved {len(resolutions)}/{len(targets)} targets; "
+              f"{len(units)} port probes queued")
+        futures = {pool.submit(probe_port, t, p, r, args): t
+                   for t, p, r in units}
+        done, step = 0, max(25, (len(futures) // 20) or 25)
         for fut in concurrent.futures.as_completed(futures):
             try:
-                all_rows.extend(fut.result())
+                all_rows.append(fut.result())
             except Exception as e:
-                # One malformed target must not discard a long run's results.
-                # Record it as a row so the failure is visible in the CSV
-                # rather than vanishing into a traceback.
-                t = futures[fut]
+                # One bad unit must not discard a long run's results; record
+                # it as a row so it is visible in the CSV, not a traceback.
                 worker_errors += 1
-                all_rows.append({
-                    "segment": t.get("segment", ""), "enabled": "",
-                    "ip_anchored": "", "entry_kind": t.get("kind", ""),
-                    "domain": t.get("domain", ""),
-                    "probe_domain": t.get("probe_domain", ""),
-                    "resolved_ip": "", "zpa_intercepted": "",
-                    "protocol": "", "port": "",
-                    "status": f"PROBE_ERROR:{type(e).__name__}",
-                    "attempts": 0, "latency_ms": "", "l7_result": ""})
+                all_rows.append(probe_error_row(futures[fut], e))
             done += 1
-            if done % 25 == 0 or done == len(futures):
-                print(f"    probed {done}/{len(futures)} targets")
+            if done % step == 0 or done == len(futures):
+                print(f"    probed {done}/{len(futures)} ports")
     except KeyboardInterrupt:
         # long full-scope runs are worth salvaging — keep partial results
         interrupted = True

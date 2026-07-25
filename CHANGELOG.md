@@ -1,5 +1,32 @@
 # Changelog
 
+## v1.5.0
+Port-level parallelism. Validated 195/195 on Linux and macOS, 194/194 on
+Windows 11.
+
+- **Ports within a segment now probe in parallel.** The pool previously
+  submitted one task per *target* and walked that target's ports serially,
+  so concurrency was capped by target count rather than probe count — a
+  50-target run could not beat `ports x timeout` no matter how many workers
+  were configured. Same 400-probe workload:
+
+  | `--workers` | before | after |
+  |---|---|---|
+  | 20  | 48.3s | 40.5s |
+  | 50  | 16.2s | 16.2s |
+  | 100 | 16.2s | 8.2s  |
+  | 200 | 16.2s | 4.2s  |
+
+- `run_test` runs two pooled phases: resolve each target once, then one task
+  per `(target, port)`. Deliberately a single flat pool — nesting a pool per
+  target would multiply to `workers x ports` and exhaust the process FD
+  limit (256 by default on macOS).
+- Probes still connect **by hostname**, not the resolved IP. That looks
+  redundant beside `resolved_ip`, but it is load-bearing: ZPA steering is
+  FQDN-driven, so connecting to a resolved address would bypass Client
+  Connector's app-list matching and silently invalidate the run.
+- Progress reports ports probed rather than targets.
+
 ## v1.4.2
 Validated 195/195 on Linux and macOS, 194/194 on Windows 11.
 
