@@ -254,6 +254,89 @@ segments have nothing answering.
 
 ---
 
+## Driving a run from a DNS export (`--dns-csv`)
+
+The segment inventory says what ZPA is *configured* to steer. A DNS export
+says what actually *exists* — and because it is captured from a DNS-server
+vantage with no Client Connector in the path, it also records what each name
+resolved to **before** ZPA. Joining the two answers the question neither
+side answers alone: which internal names are not enrolled in ZPA at all.
+
+```bash
+# put dns_destinations.csv beside the script, then:
+python3 zpa_segment_connectivity.py test --phase post \
+    --targets-file zpa-targets.json --dns-csv --report
+```
+
+Expected columns (extras are ignored, missing optional ones degrade
+gracefully): `Name`, `RecordType`, `TerminalName`, `ResolvedIPs`,
+`OnlyExternalIPs`, `HasAnyInternalIP`, `IsWildcard`, `LookupStatus`. An
+Excel BOM or a cp1252 file is handled.
+
+### It does not guess ports
+
+An enterprise-wide record list spans every server role, so there is no port
+set that would be right. Ports come only from a matching segment, and only
+where that segment says something specific:
+
+| the name | what happens |
+|---|---|
+| matches a segment defining discrete ports (`443`, `8443`) | probed on those ports |
+| matches a segment whose ranges are all wide (`1-65535`) | resolved, **never probed** |
+| matches no segment | resolved, **never probed** |
+
+**Most records will land in the middle row.** In practice few names match a
+segment by exact FQDN — they are caught by a wildcard segment with a broad
+range, and a broad range says nothing about what any single host behind it
+listens on. `expand_ports` keeps range endpoints first, so `1-65535` would
+yield ports 1, 65535, 2 and 3: probing those across thousands of names
+produces only `TIMEOUT` rows, which the summary classifies as *"nothing
+answered — traffic may not be steered"* — the exact opposite of the truth —
+and reproduces the horizontal scan this mode exists to avoid.
+
+The filter is per *range*, not per segment, so a segment defining
+`443, 8000-8100` still contributes `443` — real evidence — while discarding
+the range, which is not. Ports per name are then capped at 4 regardless of
+`--scope`. Everything dropped is counted and attributed to the segment that
+caused it, never silent.
+
+**None of this affects the answer.** Steering is settled by resolution, so
+coverage is complete whether or not a single connect is made. The run
+reports how many names matched by exact name, how many via a wildcard, and
+how many were left unprobed because their segment's ranges were too wide.
+
+### What it finds
+
+```
+  -- DNS CROSS-REFERENCE (export vs endpoint) ------------------
+    names checked    2847
+    in a ZPA segment  412   in none    2435
+    steered           298  (10.5% of names)
+
+    verdicts:
+      [!] NOT_STEERED_INTERNAL   96  — resolved to an internal IP, not
+                                       into ZPA
+          STEERED               298  — resolved into the synthetic range
+          NOT_STEERED_EXTERNAL   18  — external-only in DNS, expected
+
+    STEERING GAP (96) — enrolled in a ZPA segment, but resolved to an
+    internal IP instead of into ZPA
+    ENROLMENT GAP (2435) — internal in DNS and in no ZPA segment at all
+```
+
+*Steering gap* means enrolled but not being steered — check access policy
+and for a local resolver short-circuiting Client Connector. *Enrolment gap*
+means the name cannot be steered until a segment covers it. Eight `dns_*`
+columns land in the CSV, three clickable tiles in the HTML report, and a
+`dns_csv` block in `meta.json`.
+
+`--scope` deliberately does not thin the export: sampling would drop exactly
+the unenrolled names being hunted. Use `--dns-sample N` to cap it
+explicitly. Without a segment source the run degrades to a resolution-only
+sweep and says so.
+
+---
+
 ## Two caveats that affect how you read results
 
 Both follow from how Client Connector implements ZPA steering, and both
@@ -354,7 +437,7 @@ report           build HTML from one or two CSVs  [--out]
 
 Useful `test` flags: `--segment SUBSTR`, `--enabled-only`,
 `--wildcard-probe www`, `--sample-domains N`, `--cidr-hosts N`,
-`--max-ports N`, `--retries N`, `--l7`, `--l7-timeout S`, `--flush-dns`, `--report`,
+`--max-ports N`, `--retries N`, `--l7`, `--l7-timeout S`, `--dns-csv [CSV]`, `--dns-sample N`, `--flush-dns`, `--report`,
 `--timeout S`, `--workers N` (keep under ~200 on macOS, FD limit 256),
 `--no-show-failures`,
 `--ca-bundle PEM`, `--yes`.

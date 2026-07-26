@@ -81,7 +81,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-SCRIPT_VERSION = "1.7.0"
+SCRIPT_VERSION = "1.8.0"
 DEFAULT_API_BASE = "https://api.zsapi.net"
 OAUTH_AUDIENCE = "https://api.zscaler.com"
 # Zscaler's documented default synthetic range. It is TENANT-CONFIGURABLE:
@@ -1049,6 +1049,423 @@ def estimate_probes(targets):
 
 
 # --------------------------------------------------------------------------
+# DNS destinations CSV
+# --------------------------------------------------------------------------
+#
+# An export of enterprise DNS records — one row per record, with the name,
+# its CNAME chain, and the IPs it resolves to *from a DNS-server vantage*,
+# i.e. with no Client Connector in the path. That makes it pre-ZPA ground
+# truth, and the only reference the tool has for the question the segment
+# inventory cannot answer: which internal names are NOT enrolled in ZPA.
+#
+# Deliberately no guessed ports. An enterprise-wide record list is a mix of
+# every server role, so a fixed port set would (a) report a steered SQL host
+# as TIMEOUT, which the summary reads as "traffic may not be steered" — the
+# exact opposite of the truth — and (b) amount to a horizontal port scan
+# from a managed endpoint. Names that match a ZPA segment are probed on that
+# segment's own configured ports; names that do not are resolved and not
+# probed at all. Resolution alone answers the steering question, because
+# steering is observable in what the resolver returns.
+
+DEFAULT_DNS_CSV = "dns_destinations.csv"
+
+
+def resolve_dns_csv_path(value):
+    """Locate the export. The bare flag looks beside the script first.
+
+    The file is expected to sit next to the script, so a run from any working
+    directory finds it; an explicit path is always honoured as given.
+    """
+    if value and os.path.basename(value) != value:
+        return os.path.abspath(os.path.expanduser(value))
+    name = value or DEFAULT_DNS_CSV
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, name), os.path.abspath(name)):
+        if os.path.exists(cand):
+            return cand
+    return os.path.join(here, name)
+
+# Only records that can plausibly front a TCP service. TXT/MX/NS/SRV rows
+# would contribute nothing but failures.
+DNS_CSV_RECORD_TYPES = ("A", "CNAME")
+
+# Ports per matched name in this mode, regardless of scope. The DNS sweep
+# exists to establish steering coverage, not exhaustive reachability, and a
+# segment defining a wide range would otherwise multiply across thousands of
+# names into a scan. Whatever this drops is reported, never silent.
+DNS_CSV_PORT_CAP = 4
+
+# A port RANGE wider than this carries no information about what any single
+# host behind the segment listens on, so it contributes nothing here.
+#
+# This is the common shape in practice: most records in an enterprise export
+# match no segment *explicitly* — they are caught by a wildcard segment with
+# a broad range. Treating that as an authoritative port list is worse than
+# having none. expand_ports keeps range endpoints first, so `1-65535` yields
+# ports 1, 65535, 2, 3; probing those across thousands of names produces
+# nothing but TIMEOUT rows, which the summary reads as "traffic may not be
+# steered", and reproduces exactly the scan this mode avoids.
+#
+# The filter is per-range rather than per-segment, so a segment defining
+# `443, 8000-8100` still contributes 443 — real evidence — while discarding
+# the range, which is not. A segment whose every range is wide contributes
+# nothing and its names are resolved only. The steering answer is unaffected
+# either way: that comes from resolution, not from any connect.
+DNS_CSV_MAX_RANGE_SPAN = 4
+
+
+def dns_specific_ports(seg, cap):
+    """(ports, dropped) — only the ports that actually identify a service.
+
+    Wide ranges are dropped rather than sampled. Sampling one would test two
+    arbitrary ports out of a hundred and silently leave the rest untested,
+    which reads in the summary as though the host had been checked.
+    """
+    ranges = port_ranges(seg, "tcpPortRange")
+    narrow, dropped = [], 0
+    for lo, hi in ranges:
+        if hi - lo + 1 <= DNS_CSV_MAX_RANGE_SPAN:
+            narrow.append((lo, hi))
+        else:
+            dropped += hi - lo + 1
+    ports, trunc = expand_ports(narrow, cap)
+    return ports, dropped + trunc
+
+DNS_CSV_FIELDS = ["dns_record_type", "dns_terminal_name", "dns_resolved_ips",
+                  "dns_only_external", "dns_has_internal", "dns_in_zpa",
+                  "dns_ip_match", "dns_verdict"]
+
+# What each cross-reference verdict means, for the summary legend.
+DNS_VERDICTS = {
+    "STEERED": "resolved into the synthetic range — ZPA is handling it",
+    "NOT_STEERED_INTERNAL": "resolved to an internal IP, not into ZPA — "
+                            "an internal app reached outside ZPA",
+    "NOT_STEERED_EXTERNAL": "external-only in DNS — not a ZPA candidate, "
+                            "expected",
+    "NOT_STEERED_UNKNOWN": "not steered, and the export has no IPs to "
+                           "classify it by",
+    "DNS_FAIL": "did not resolve at the endpoint",
+}
+
+
+def _csv_bool(value):
+    """TRUE/FALSE from the export; anything unrecognised stays unknown."""
+    v = str(value or "").strip().lower()
+    if v in ("true", "1", "yes"):
+        return True
+    if v in ("false", "0", "no"):
+        return False
+    return None
+
+
+def _dns_row_get(row, *names):
+    """Case-insensitive column read; the export's casing is not guaranteed."""
+    for n in names:
+        if n in row:
+            return (row[n] or "").strip()
+    return ""
+
+
+def load_dns_csv(path, args):
+    """Parse the DNS export into per-name records, or exit with guidance.
+
+    Returns (by_name, stats). Rows are keyed by the *queried* name, not the
+    CNAME terminal: ZPA steering matches what the client asks for, so the
+    alias is the thing to probe and the terminal is reference data.
+    """
+    if not os.path.exists(path):
+        sys.exit(f"ERROR: --dns-csv file not found: {path}\n"
+                 f"Place {DEFAULT_DNS_CSV} beside the script, or pass an "
+                 "explicit path.")
+    # utf-8-sig so an Excel-written BOM does not become part of the first
+    # header name, which would silently break every column lookup.
+    #
+    # The fallback is not defensive padding: Excel on Windows writes cp1252
+    # by default, so one accented character or smart quote anywhere in an
+    # enterprise-wide export would otherwise abort the whole run with a
+    # UnicodeDecodeError. Names are ASCII in practice, so decoding the rest
+    # leniently loses nothing that matters.
+    encoding = "utf-8-sig"
+    try:
+        with open(path, encoding=encoding) as probe:
+            probe.read(65536)
+    except UnicodeDecodeError:
+        encoding = "cp1252"
+        print(f"[*] {os.path.basename(path)} is not UTF-8; reading as cp1252")
+    except OSError as e:
+        sys.exit(f"ERROR: cannot read --dns-csv {path}: {e}")
+    try:
+        fh = open(path, newline="", encoding=encoding, errors="replace")
+    except OSError as e:
+        sys.exit(f"ERROR: cannot read --dns-csv {path}: {e}")
+    stats = {"rows": 0, "skipped_type": 0, "skipped_lookup": 0,
+             "skipped_wildcard": 0, "skipped_noname": 0, "duplicates": 0,
+             "record_types": {}}
+    by_name = {}
+    try:
+        try:
+            reader = csv.DictReader(fh)
+            fields = reader.fieldnames or []
+            if not any(f and f.strip().lower() == "name" for f in fields):
+                sys.exit(f"ERROR: {path} has no 'Name' column — this does "
+                         "not look like a DNS destinations export. Columns "
+                         f"found: {', '.join(str(f) for f in fields[:8])}")
+            for raw in reader:
+                stats["rows"] += 1
+                name = _dns_row_get(raw, "Name", "name", "NAME").lower()
+                name = name.rstrip(".")
+                if not name:
+                    stats["skipped_noname"] += 1
+                    continue
+                rtype = _dns_row_get(raw, "RecordType", "recordtype",
+                                     "Record_Type").upper()
+                stats["record_types"][rtype or "(blank)"] = \
+                    stats["record_types"].get(rtype or "(blank)", 0) + 1
+                if rtype and rtype not in DNS_CSV_RECORD_TYPES:
+                    stats["skipped_type"] += 1
+                    continue
+                lookup = _dns_row_get(raw, "LookupStatus",
+                                      "lookupstatus").upper()
+                if lookup and lookup != "OK":
+                    stats["skipped_lookup"] += 1
+                    continue
+                wildcard = _csv_bool(_dns_row_get(raw, "IsWildcard",
+                                                  "iswildcard"))
+                if wildcard or name.startswith("*"):
+                    if not args.wildcard_probe:
+                        stats["skipped_wildcard"] += 1
+                        continue
+                    name = args.wildcard_probe + name.lstrip("*")
+                if name in by_name:
+                    stats["duplicates"] += 1
+                    continue
+                ips = [p.strip() for p in
+                       _dns_row_get(raw, "ResolvedIPs", "resolvedips")
+                       .replace(",", ";").split(";") if p.strip()]
+                by_name[name] = {
+                    "name": name,
+                    "record_type": rtype,
+                    "terminal": _dns_row_get(raw, "TerminalName",
+                                             "terminalname").lower(),
+                    "ips": ips,
+                    "only_external": _csv_bool(
+                        _dns_row_get(raw, "OnlyExternalIPs",
+                                     "onlyexternalips")),
+                    "has_internal": _csv_bool(
+                        _dns_row_get(raw, "HasAnyInternalIP",
+                                     "hasanyinternalip")),
+                    "zone": _dns_row_get(raw, "ZoneName", "zonename"),
+                }
+        except csv.Error as e:
+            sys.exit(f"ERROR: {path} is not readable as CSV: {e}")
+    finally:
+        fh.close()
+    if not by_name:
+        sys.exit(f"ERROR: {path} yielded no usable records "
+                 f"({stats['rows']} rows read; "
+                 f"{stats['skipped_type']} wrong record type, "
+                 f"{stats['skipped_lookup']} lookup not OK, "
+                 f"{stats['skipped_wildcard']} wildcard).")
+    return by_name, stats
+
+
+def segment_domain_index(segments, args):
+    """domain -> segment, for every segment the run's filters keep.
+
+    Wildcards are stored under their parent so `*.corp.example` matches
+    `app.corp.example`, which is how ZPA itself resolves an app-list hit.
+    """
+    exact, wild = {}, {}
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        name = str(seg.get("name") or f"(unnamed-{seg.get('id', '?')})")
+        if args.sipa_only and not seg.get("ipAnchored"):
+            continue
+        if args.enabled_only and not seg.get("enabled", True):
+            continue
+        if args.segment and args.segment.lower() not in name.lower():
+            continue
+        for entry in seg.get("domainNames") or []:
+            e = str(entry).strip().lower()
+            if not e:
+                continue
+            if e.startswith("*."):
+                wild.setdefault(e[1:], (name, seg))
+            elif classify_entry(e) == "fqdn":
+                exact.setdefault(e, (name, seg))
+    return exact, wild
+
+
+def match_segment(host, exact, wild):
+    """(segment_name, segment) for a host, or (None, None)."""
+    h = host.lower().rstrip(".")
+    if h in exact:
+        return exact[h]
+    parent = h
+    while "." in parent:
+        parent = parent.split(".", 1)[1]
+        hit = wild.get("." + parent)
+        if hit:
+            return hit
+    return None, None
+
+
+def build_dns_targets(by_name, segments, args):
+    """Targets from the DNS export. Ports come only from matched segments."""
+    exact, wild = segment_domain_index(segments or [], args)
+    names = sorted(by_name)
+    stats = {"names_total": len(names), "names_sampled_out": 0,
+             "matched": 0, "unmatched": 0, "ports_truncated": 0,
+             "matched_exact": 0, "matched_wildcard": 0,
+             "broad_ports": 0, "probed": 0, "broad_segments": {}}
+
+    # --scope deliberately does NOT thin this list. The question the export
+    # answers is which names are absent from ZPA, and sampling would drop
+    # exactly the unenrolled records being hunted. Resolution is cheap, so
+    # the default is every record; --dns-sample caps it explicitly.
+    if args.dns_sample and len(names) > args.dns_sample:
+        keep = spread_sample(names, args.dns_sample)
+        stats["names_sampled_out"] = len(names) - len(keep)
+        names = keep
+
+    cap = min(DNS_CSV_PORT_CAP, args.max_ports or DNS_CSV_PORT_CAP)
+    # Port breadth is a property of the segment, not of the name, so it is
+    # measured once per segment rather than per record.
+    breadth = {}
+    targets = []
+    for name in names:
+        seg_name, seg = match_segment(name, exact, wild)
+        via_wild = seg is not None and name not in exact
+        if seg is None:
+            stats["unmatched"] += 1
+            ports, udp = [], []
+            seg_label = "(not in any ZPA segment)"
+        else:
+            stats["matched"] += 1
+            stats["matched_wildcard" if via_wild else "matched_exact"] += 1
+            sid = str(seg.get("id") or seg_name)
+            if sid not in breadth:
+                breadth[sid] = dns_specific_ports(seg, cap)
+            ports, dropped = breadth[sid]
+            ports = list(ports)
+            stats["ports_truncated"] += dropped
+            if ports:
+                stats["probed"] += 1
+            else:
+                # Nominally matched, but every range the segment defines is
+                # too wide to say anything about this host. Resolve only,
+                # and record which segment caused it so the run can say so.
+                stats["broad_ports"] += 1
+                stats["broad_segments"][seg_name] = \
+                    stats["broad_segments"].get(seg_name, 0) + 1
+            udp = []
+            seg_label = seg_name
+        targets.append({
+            "segment": seg_label,
+            "segment_id": (seg or {}).get("id", ""),
+            "enabled": bool((seg or {}).get("enabled", True)),
+            "ip_anchored": bool((seg or {}).get("ipAnchored", False)),
+            "ports": ports,
+            "udp_ranges": udp,
+            "kind": "fqdn",
+            "domain": name,
+            "probe_domain": name,
+            "dns_ref": by_name[name],
+            "dns_in_zpa": seg is not None,
+            "dns_via_wildcard": via_wild,
+        })
+    return targets, stats
+
+
+def dns_verdict_for(row, ref, intercepted):
+    """Steering verdict for one name, given the export as the reference."""
+    if str(row.get("status", "")).startswith("DNS_FAIL"):
+        return "DNS_FAIL"
+    if intercepted is True:
+        return "STEERED"
+    if ref.get("only_external") is True:
+        return "NOT_STEERED_EXTERNAL"
+    if ref.get("has_internal") is True or ref.get("ips"):
+        return "NOT_STEERED_INTERNAL"
+    return "NOT_STEERED_UNKNOWN"
+
+
+def annotate_dns_rows(rows, targets):
+    """Attach the export's reference data and the verdict to each row.
+
+    Keyed on probe_domain rather than carried through the probe path, so the
+    concurrency layer stays unaware of any of this.
+    """
+    refs = {t["probe_domain"]: t for t in targets if t.get("dns_ref")}
+    for row in rows:
+        t = refs.get(str(row.get("probe_domain", "")))
+        if not t:
+            continue
+        ref = t["dns_ref"]
+        intercepted = row.get("zpa_intercepted")
+        ip = str(row.get("resolved_ip") or "")
+        ip_match = "" if not ref["ips"] or not ip else (ip in ref["ips"])
+        row.update({
+            "dns_record_type": ref["record_type"],
+            "dns_terminal_name": ref["terminal"],
+            "dns_resolved_ips": ";".join(ref["ips"]),
+            "dns_only_external": ref["only_external"]
+            if ref["only_external"] is not None else "",
+            "dns_has_internal": ref["has_internal"]
+            if ref["has_internal"] is not None else "",
+            "dns_in_zpa": t["dns_in_zpa"],
+            "dns_ip_match": ip_match,
+            "dns_verdict": dns_verdict_for(row, ref, intercepted),
+        })
+    return rows
+
+
+def dns_stats(rows):
+    """Cross-reference rollup, or None when --dns-csv was not used.
+
+    Counted per NAME, not per probe: a name with four ports would otherwise
+    contribute four times to a coverage figure that is about names.
+    """
+    seen, verdicts = {}, {}
+    for r in rows:
+        v = r.get("dns_verdict")
+        if not v:
+            continue
+        name = str(r.get("probe_domain", ""))
+        if name in seen:
+            continue
+        seen[name] = r
+        verdicts[v] = verdicts.get(v, 0) + 1
+    if not seen:
+        return None
+
+    in_zpa = sum(1 for r in seen.values() if r.get("dns_in_zpa") is True)
+    # An internal name in no ZPA segment cannot be steered — that is an
+    # enrolment gap, distinct from a name that is enrolled and still is not
+    # being steered.
+    enrol_gap = [n for n, r in seen.items()
+                 if r.get("dns_in_zpa") is not True
+                 and r.get("dns_has_internal") is True]
+    steer_gap = [n for n, r in seen.items()
+                 if r.get("dns_verdict") == "NOT_STEERED_INTERNAL"
+                 and r.get("dns_in_zpa") is True]
+    diverged = [n for n, r in seen.items() if r.get("dns_ip_match") is False
+                and r.get("dns_verdict") != "STEERED"]
+    return {
+        "names": len(seen),
+        "in_zpa": in_zpa,
+        "not_in_zpa": len(seen) - in_zpa,
+        "verdicts": verdicts,
+        "steered": verdicts.get("STEERED", 0),
+        "pct_steered": round(100.0 * verdicts.get("STEERED", 0) / len(seen), 1),
+        "enrolment_gap": sorted(enrol_gap),
+        "steering_gap": sorted(steer_gap),
+        "diverged": sorted(diverged),
+    }
+
+
+# --------------------------------------------------------------------------
 # Scope selection / confirmation
 # --------------------------------------------------------------------------
 
@@ -1466,13 +1883,20 @@ def coverage_report(stats, args, tcp_probes):
     lines.append(f"  tcp ports:         {tcp_probes}/{ports_total} probed "
                  f"({port_pct:.1f}%)")
     if stats["ports_truncated"]:
+        # In --dns-csv mode the binding cap is DNS_CSV_PORT_CAP, and --scope
+        # full does NOT lift it. Naming --max-ports here would send someone
+        # to a flag that cannot change the number they are looking at.
+        why = (f"--dns-csv caps ports at {DNS_CSV_PORT_CAP} per name; "
+               "--scope does not lift this"
+               if getattr(args, "dns_csv", None) else
+               f"--max-ports {args.max_ports}; --scope full for all")
         lines.append(f"                     {stats['ports_truncated']} dropped "
-                     f"(--max-ports {args.max_ports}; --scope full for all)")
+                     f"({why})")
     return lines
 
 
 def next_steps(args, stats, action, unverifiable, dns_fail, dns_flush_ok,
-               intercepted, l7s=None):
+               intercepted, l7s=None, dstats=None):
     """Recommendations derived from this run's actual results.
 
     dns_flush_ok is the boolean from flush_dns_cache(): True fully flushed,
@@ -1505,6 +1929,21 @@ def next_steps(args, stats, action, unverifiable, dns_fail, dns_flush_ok,
             f"{len(unverifiable)} probe(s) across {len(segs)} segment(s) were "
             "IP/CIDR entries, which cannot prove steering from an endpoint "
             "(caveat 1). Confirm them in the ZPA admin portal's access logs.")
+    if dstats and dstats["steering_gap"]:
+        steps.append(
+            f"{len(dstats['steering_gap'])} name(s) are enrolled in a ZPA "
+            "segment but resolved to an internal IP rather than into the "
+            "synthetic range. Those are reaching the app outside ZPA — check "
+            "the access policy covers your account for those segments, and "
+            "that no local resolver or /etc/hosts entry is short-circuiting "
+            "Client Connector.")
+    if dstats and dstats["enrolment_gap"]:
+        steps.append(
+            f"{len(dstats['enrolment_gap'])} internal name(s) in the DNS "
+            "export are in no ZPA segment. They cannot be steered until a "
+            "segment covers them — this is the coverage gap the export "
+            "exists to surface. Review them for enrolment (dns_in_zpa=False "
+            "with dns_has_internal=True in the CSV).")
     if l7s and l7s["unverified"]:
         err = l7s["breakdown"].get("L7_ERROR", 0)
         step = (f"{l7s['unverified']} of {l7s['probed']} OPEN probes "
@@ -1775,9 +2214,23 @@ def segment_rollup(all_rows):
 
 def run_test(args):
     args.scope_resolved = choose_scope(args)
+    # Normalised once rather than read defensively in eight places. A
+    # namespace assembled without these — a caller, or an older test
+    # harness — would otherwise die with AttributeError partway through,
+    # which is exactly how --tenant broke on export-targets in v1.8.1.
+    args.dns_csv = getattr(args, "dns_csv", None)
+    args.dns_sample = getattr(args, "dns_sample", 0)
+
+    # With --dns-csv and no segment source, the run is a resolution sweep:
+    # it still answers which names are steered, it just has nothing to join
+    # against for ports or enrolment. That is a valid mode, so it must not
+    # fail preflight for missing credentials.
+    dns_standalone = bool(args.dns_csv) and not (
+        args.targets_file or args.tenant or args.client_id
+        or os.environ.get("ZSCALER_CLIENT_ID"))
 
     ok, checks = preflight_checks(
-        args, need_api=not args.targets_file,
+        args, need_api=not args.targets_file and not dns_standalone,
         need_targets_file=args.targets_file)
     print_checks(checks)
     if not ok and not args.yes:
@@ -1797,13 +2250,67 @@ def run_test(args):
                   "can mask ZPA steering in a post run.")
 
     zcc = detect_zcc()
-    segments, source = load_segments(args)
+    if dns_standalone:
+        segments, source = [], "none (--dns-csv resolve-only)"
+    else:
+        segments, source = load_segments(args)
 
-    targets, skipped_wildcards, stats = build_targets(segments, args)
+    dns_by_name, dns_load, dns_build = None, None, None
+    if args.dns_csv:
+        dns_path = resolve_dns_csv_path(args.dns_csv)
+        dns_by_name, dns_load = load_dns_csv(dns_path, args)
+        targets, dns_build = build_dns_targets(dns_by_name, segments, args)
+        skipped_wildcards = []
+        stats = {"entries_total": dns_build["names_total"],
+                 "entries_sampled_out": dns_build["names_sampled_out"],
+                 "cidr_hosts_truncated": 0,
+                 "ports_truncated": dns_build["ports_truncated"],
+                 "segments_matched": dns_build["matched"],
+                 "kinds": {"fqdn": dns_build["names_total"], "ip": 0,
+                           "cidr": 0, "wildcard": 0}}
+        source = f"dns-csv {os.path.basename(dns_path)}" + (
+            "" if dns_standalone else f" x {source}")
+    else:
+        targets, skipped_wildcards, stats = build_targets(segments, args)
+
     k = stats["kinds"]
     print(f"[*] Scope: {args.scope_resolved.upper()}")
     if args.sipa_only:
         print("[*] SIPA filter active (ipAnchored=true segments only)")
+    if args.dns_csv:
+        print(f"[*] DNS export: {dns_path}")
+        print(f"    {dns_load['rows']} rows -> {dns_build['names_total']} "
+              "probeable names"
+              + (f"; skipped {dns_load['skipped_type']} non-A/CNAME"
+                 if dns_load["skipped_type"] else "")
+              + (f", {dns_load['skipped_lookup']} lookup!=OK"
+                 if dns_load["skipped_lookup"] else "")
+              + (f", {dns_load['skipped_wildcard']} wildcard"
+                 if dns_load["skipped_wildcard"] else "")
+              + (f", {dns_load['duplicates']} duplicate"
+                 if dns_load["duplicates"] else ""))
+        print(f"    {dns_build['matched']} matched a ZPA segment "
+              f"({dns_build['matched_exact']} by exact name, "
+              f"{dns_build['matched_wildcard']} via a wildcard)")
+        print(f"    {dns_build['probed']} probed on their segment's own "
+              f"ports (max {DNS_CSV_PORT_CAP} per name)")
+        if dns_build["broad_ports"]:
+            print(f"    {dns_build['broad_ports']} matched a segment whose "
+                  "every port range is wider than "
+                  f"{DNS_CSV_MAX_RANGE_SPAN} — resolved, NOT probed: a wide "
+                  "range says nothing about what any one host listens on, "
+                  "and probing its endpoints would yield only timeouts")
+            for sname, n in sorted(dns_build["broad_segments"].items(),
+                                   key=lambda kv: -kv[1])[:5]:
+                print(f"      {sname[:52]:<52} {n:>6} name(s)")
+        print(f"    {dns_build['unmatched']} matched no segment — resolved, "
+              "NOT probed (no guessed ports, no scan footprint)")
+        print("    steering is settled by resolution, so coverage is "
+              "complete either way")
+        if dns_standalone:
+            print("    [!] no segment source given, so nothing could be "
+                  "matched — this is a resolution-only sweep. Add "
+                  "--targets-file for the ZPA join.")
     print(f"[*] Segments matched: {stats['segments_matched']}")
     print(f"[*] Entries: {stats['entries_total']} total "
           f"({k['fqdn']} fqdn, {k['ip']} ip, {k['cidr']} cidr, "
@@ -1815,8 +2322,12 @@ def run_test(args):
         print(f"[!] {stats['cidr_hosts_truncated']} CIDR hosts beyond the "
               f"{FULL_CIDR_HOST_CAP}-host cap were NOT queued")
     if stats["ports_truncated"]:
-        print(f"[*] {stats['ports_truncated']} ports dropped by --max-ports "
-              f"cap (use --scope full for all ports)")
+        print(f"[*] {stats['ports_truncated']} ports dropped by "
+              + (f"the --dns-csv cap of {DNS_CSV_PORT_CAP} per name "
+                 "(deliberate: it keeps a wide segment range from "
+                 "multiplying across the export into a scan)"
+                 if args.dns_csv else
+                 "--max-ports cap (use --scope full for all ports)"))
     if skipped_wildcards:
         print(f"[!] {len(skipped_wildcards)} wildcard domains skipped "
               f"(re-run with --wildcard-probe <label> to include them)")
@@ -1894,6 +2405,11 @@ def run_test(args):
                                  str(r["probe_domain"]),
                                  str(r["protocol"]), str(r["port"])))
 
+    # After sorting, before writing: the cross-reference reads finished rows
+    # and adds columns, so the probe path never has to know about the export.
+    if args.dns_csv:
+        annotate_dns_rows(all_rows, targets)
+
     out_dir = os.path.abspath(os.path.expanduser(args.output_dir))
     os.makedirs(out_dir, exist_ok=True)
     ts = started.strftime("%Y%m%dT%H%M%SZ")
@@ -1906,8 +2422,9 @@ def run_test(args):
     # Explicit UTF-8: Windows still defaults to the locale code page (cp1252
     # here), so a segment name outside it would raise UnicodeEncodeError at
     # this line — after every probe had already run.
+    fieldnames = CSV_FIELDS + (DNS_CSV_FIELDS if args.dns_csv else [])
     with open(out_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(all_rows)
 
@@ -1927,6 +2444,7 @@ def run_test(args):
     verdict_label, verdict_detail = run_verdict(args, intercepted, zcc, synth)
     lat = latency_stats(all_rows)
     l7s = l7_stats(all_rows)
+    dstats = dns_stats(all_rows) if args.dns_csv else None
 
     meta = {
         "script_version": SCRIPT_VERSION,
@@ -1964,6 +2482,12 @@ def run_test(args):
         "status_counts": status_histogram(all_rows),
         "latency": lat,
         "l7": l7s,
+        "dns_csv": (None if not args.dns_csv else
+                    {"path": dns_path, "load": dns_load, "build": dns_build,
+                     "crossref": dstats}),
+        "slowest_segments": [{"segment": s, "median_ms": m, "probes": n}
+                             for s, m, n in slowest_segments(all_rows)],
+
         "slowest_segments": [{"segment": s, "median_ms": m, "probes": n}
                              for s, m, n in slowest_segments(all_rows)],
         "intercepted_domain_list": sorted(intercepted),
@@ -1995,6 +2519,38 @@ def run_test(args):
     print(_section("COVERAGE"))
     for line in coverage_report(stats, args, len(tcp_rows)):
         print(line)
+
+    if dstats:
+        print(_section("DNS CROSS-REFERENCE (export vs endpoint)"))
+        print(f"    names checked  {dstats['names']:>6}")
+        print(f"    in a ZPA segment {dstats['in_zpa']:>4}   "
+              f"in none {dstats['not_in_zpa']:>6}")
+        print(f"    steered        {dstats['steered']:>6}  "
+              f"({dstats['pct_steered']}% of names)")
+        print("\n    verdicts:")
+        for v, n in sorted(dstats["verdicts"].items(), key=lambda kv: -kv[1]):
+            mark = " [!]" if v == "NOT_STEERED_INTERNAL" else "    "
+            print(f"     {mark} {v:<24} {n:>5}"
+                  + (f"  — {DNS_VERDICTS[v]}" if v in DNS_VERDICTS else ""))
+
+        for label, names, note in (
+                ("STEERING GAP", dstats["steering_gap"],
+                 "enrolled in a ZPA segment, but resolved to an internal IP "
+                 "instead of into ZPA"),
+                ("ENROLMENT GAP", dstats["enrolment_gap"],
+                 "internal in DNS and in no ZPA segment at all — cannot be "
+                 "steered until a segment covers them"),
+                ("DNS DIVERGENCE", dstats["diverged"],
+                 "endpoint resolved to an address the export does not list "
+                 "— split-horizon, staleness, or a different resolver")):
+            if not names:
+                continue
+            print(f"\n    {label} ({len(names)}) — {note}")
+            for n in names[:INTERCEPT_LIST_CAP]:
+                print(f"      {n}")
+            if len(names) > INTERCEPT_LIST_CAP:
+                print(f"      ... +{len(names) - INTERCEPT_LIST_CAP} more "
+                      "(see dns_verdict in the CSV)")
 
     if l7s:
         print(_section("L7 VERIFICATION (application response on OPEN ports)"))
@@ -2103,7 +2659,7 @@ def run_test(args):
                 print(f"      {seg[:34]:<34} {shown}")
 
     steps = next_steps(args, stats, action, unverifiable, dns_fail,
-                       dns_flush_ok, intercepted, l7s)
+                       dns_flush_ok, intercepted, l7s, dstats)
     if steps:
         print(_section("NEXT STEPS"))
         for i, s in enumerate(steps, 1):
@@ -2355,14 +2911,21 @@ HTML_JS = """
     dnsfail:   function(d){ return d.status.indexOf('DNS_FAIL') === 0; },
     steered:   function(d){ return d.steered === 'True'; },
     l7verified:   function(d){ return l7ran(d) && l7ok(d); },
-    l7unverified: function(d){ return l7ran(d) && !l7ok(d); }
+    l7unverified: function(d){ return l7ran(d) && !l7ok(d); },
+    dnssteered:   function(d){ return d.dnsv === 'STEERED'; },
+    dnsgap:       function(d){ return d.dnsv === 'NOT_STEERED_INTERNAL'; },
+    dnsnotinzpa:  function(d){ return d.dnsv !== '' && d.dnszpa !== 'True'
+                                     && d.dnsint === 'True'; }
   };
   var LABEL = {
     reachable: 'TCP reachable', failing: 'failing probes',
     flaky: 'flaky (retry only)', dnsfail: 'DNS failures',
     steered: 'ZPA-steered rows',
     l7verified: 'L7 verified (application responded)',
-    l7unverified: 'OPEN with no application response'
+    l7unverified: 'OPEN with no application response',
+    dnssteered: 'DNS names steered into ZPA',
+    dnsgap: 'enrolled but resolved to an internal IP',
+    dnsnotinzpa: 'internal in DNS, in no ZPA segment'
   };
 
   document.querySelectorAll('table[id]').forEach(function(table){
@@ -2381,6 +2944,9 @@ HTML_JS = """
         var d = { status:  tr.getAttribute('data-status')  || '',
                   proto:   tr.getAttribute('data-proto')   || '',
                   l7:      tr.getAttribute('data-l7')      || '',
+                  dnsv:    tr.getAttribute('data-dnsv')    || '',
+                  dnszpa:  tr.getAttribute('data-dnszpa')  || '',
+                  dnsint:  tr.getAttribute('data-dnsint')  || '',
                   steered: tr.getAttribute('data-steered') || '' };
         var pass = true;
         if (active && active.status !== undefined) {
@@ -2493,7 +3059,10 @@ def write_html_report(out_path, runs, diff=None):
         flaky = [r for r in tcp if r.get("status") == "OPEN_FLAKY"]
         dns_fail = [r for r in rows
                     if str(r.get("status", "")).startswith("DNS_FAIL")]
-        interc = {r["domain"] for r in rows
+        # .get, not [], throughout: rows reach this function from callers as
+        # well as from a results CSV, and one missing column should not be a
+        # traceback in the reporting layer.
+        interc = {r.get("domain", "") for r in rows
                   if str(r.get("zpa_intercepted")) == "True"}
         fails = [r for r in tcp if r.get("status") not in OK_STATUSES]
 
@@ -2555,6 +3124,31 @@ def write_html_report(out_path, runs, diff=None):
                                filt="l7verified"))
             parts.append(_tile(l7_bad, "no app response",
                                "bad" if l7_bad else "ok", filt="l7unverified"))
+        # Derived from the rows for the same reason as the L7 pair: a CSV
+        # written by any version renders correctly without its meta.
+        dns_rows = [r for r in rows if r.get("dns_verdict")]
+        if dns_rows:
+            seen_names, dv = set(), {}
+            for r in dns_rows:
+                nm = str(r.get("probe_domain", ""))
+                if nm in seen_names:
+                    continue
+                seen_names.add(nm)
+                dv[r["dns_verdict"]] = dv.get(r["dns_verdict"], 0) + 1
+                if str(r.get("dns_in_zpa")) != "True" \
+                        and str(r.get("dns_has_internal")) == "True":
+                    dv["_enrol"] = dv.get("_enrol", 0) + 1
+            steered_n = dv.get("STEERED", 0)
+            gap_n = dv.get("NOT_STEERED_INTERNAL", 0)
+            parts.append(_tile(f"{steered_n}/{len(seen_names)}",
+                               "DNS names steered",
+                               "ok" if steered_n == len(seen_names) else "info",
+                               filt="dnssteered"))
+            parts.append(_tile(gap_n, "not steered (internal)",
+                               "bad" if gap_n else "ok", filt="dnsgap"))
+            parts.append(_tile(dv.get("_enrol", 0), "internal, not in ZPA",
+                               "warn" if dv.get("_enrol") else "ok",
+                               filt="dnsnotinzpa"))
         lat_m = (meta.get("latency") or {}).get("median_ms")
         if lat_m is not None:
             # a median is not a row set — deliberately not a filter
@@ -2569,6 +3163,10 @@ def write_html_report(out_path, runs, diff=None):
         cols = ["segment", "entry_kind", "domain", "probe_domain",
                 "resolved_ip", "zpa_intercepted", "protocol", "port",
                 "status", "latency_ms", "l7_result"]
+        # The DNS columns only exist on a --dns-csv run; adding them
+        # unconditionally would render a block of empty cells on every
+        # other report.
+        cols += [c for c in DNS_CSV_FIELDS if any(c in r for r in rows)]
         for c in cols:
             parts.append(f"<th>{html.escape(c)}</th>")
         parts.append("</tr></thead><tbody>")
@@ -2581,6 +3179,9 @@ def write_html_report(out_path, runs, diff=None):
                 f'<tr data-status="{html.escape(st)}" '
                 f'data-proto="{html.escape(str(r.get("protocol", "")))}" '
                 f'data-l7="{html.escape(str(r.get("l7_result", "")))}" '
+                f'data-dnsv="{html.escape(str(r.get("dns_verdict", "")))}" '
+                f'data-dnszpa="{html.escape(str(r.get("dns_in_zpa", "")))}" '
+                f'data-dnsint="{html.escape(str(r.get("dns_has_internal", "")))}" '
                 f'data-steered="{html.escape(str(r.get("zpa_intercepted", "")))}">')
             for c in cols:
                 v = r.get(c, "")
@@ -3065,6 +3666,23 @@ def main():
                         "Connector, but a TLS handshake has to reach the "
                         "backend via the App Connector — sharing --timeout "
                         "reports working apps as L7 timeouts")
+    t.add_argument("--dns-csv", nargs="?", const=DEFAULT_DNS_CSV,
+                   metavar="CSV",
+                   help=f"drive the run from a DNS destinations export "
+                        f"instead of the segment inventory. Bare --dns-csv "
+                        f"looks for {DEFAULT_DNS_CSV} beside the script. "
+                        "Each name is matched against the ZPA segments: "
+                        "matched names are probed on that segment's OWN "
+                        "ports, unmatched names are resolved and never "
+                        "probed — no guessed ports, so no false timeouts and "
+                        "no scan footprint. Combine with --targets-file (or "
+                        "credentials) for the segment join; without one it "
+                        "is a resolution-only sweep")
+    t.add_argument("--dns-sample", type=int, default=0, metavar="N",
+                   help="cap the DNS export at N names (default 0 = every "
+                        "record). --scope does not thin this list: sampling "
+                        "would drop exactly the unenrolled names the export "
+                        "exists to surface, and resolution is cheap")
     t.add_argument("--sipa-only", action="store_true",
                    help="only test Source IP Anchoring segments "
                         "(ipAnchored=true) — typical for --phase pre")

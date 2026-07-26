@@ -1,5 +1,58 @@
 # Changelog
 
+## v1.8.0
+Drive a run from an enterprise DNS export and cross-reference it against the
+ZPA segment inventory. Validated 296/296 on Linux, up from 247/247, plus 80/80 on a new
+--dns-csv regression suite.
+
+The segment inventory says what ZPA is *configured* to steer. A DNS export
+says what actually *exists*, and — because it is captured from a DNS-server
+vantage with no Client Connector in the path — what each name resolved to
+before ZPA. Joining the two answers the question neither side can answer
+alone: which internal names are not enrolled in ZPA at all.
+
+- **`--dns-csv [CSV]`** drives the run from the export instead of the
+  segment list. Bare `--dns-csv` looks for `dns_destinations.csv` beside the
+  script. Reads the standard export schema (`Name`, `RecordType`,
+  `TerminalName`, `ResolvedIPs`, `OnlyExternalIPs`, `HasAnyInternalIP`,
+  `IsWildcard`, `LookupStatus`), tolerates an Excel BOM or a cp1252 file,
+  and reports every row it skipped and why.
+- **No guessed ports, by design.** An enterprise-wide record list spans
+  every server role. Ports come only from a matching segment, and only where
+  that segment says something specific: a segment defining discrete ports is
+  probed on them, a segment whose ranges are all wide is not probed at all,
+  and a name matching no segment is resolved only. Resolution alone settles
+  steering, because steering is visible in what the resolver returns.
+- **Most records land in the unprobed case, deliberately.** Few names match
+  a segment by exact FQDN; they are caught by a wildcard segment with a
+  broad range, which says nothing about what any one host listens on.
+  `expand_ports` keeps range endpoints first, so `1-65535` would yield ports
+  1, 65535, 2 and 3 — across thousands of names that is a scan producing
+  only timeouts. The filter is per *range*, so `443, 8000-8100` still
+  contributes 443 while discarding the range. Everything dropped is counted
+  and attributed to the segment that caused it.
+- **Why that matters twice over.** A fixed port set would report a steered
+  database host as `TIMEOUT`, which the summary classifies as "nothing
+  answered — traffic may not be steered": the exact opposite of the truth.
+  It would also constitute a horizontal port scan across the enterprise from
+  a managed endpoint.
+- **Two gaps, reported separately.** *Steering gap* — enrolled in a segment
+  but resolved to an internal IP rather than into the synthetic range.
+  *Enrolment gap* — internal in DNS and in no segment at all, so it cannot
+  be steered until one covers it. Plus DNS divergence, where the endpoint
+  resolved to an address the export does not list.
+- **New output.** A `DNS CROSS-REFERENCE` console section with per-verdict
+  meanings, eight `dns_*` CSV columns, three clickable report tiles, a
+  `dns_csv` block in `meta.json`, and `NEXT STEPS` entries for each gap.
+- **Bounded.** Ports per name are capped at 4 regardless of `--scope`.
+  `--scope` deliberately does not thin the export — sampling would drop
+  exactly the unenrolled names being hunted — and `--dns-sample N` caps it
+  explicitly instead.
+- Works without credentials: with no segment source it degrades to a
+  resolution-only sweep and says so.
+- Fixed: `write_html_report` indexed `row["domain"]` directly and raised
+  `KeyError` on a caller-supplied row missing that column.
+
 ## v1.7.0
 L7 verification reaches the summary, and three measurement fixes behind it.
 Validated 247/247 on Linux.

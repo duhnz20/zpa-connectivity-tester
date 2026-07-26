@@ -60,7 +60,7 @@ class Args:
             ca_bundle=None, client_id=None, vanity_domain=None,
             customer_id=None, api_base="https://api.zsapi.net",
             targets_file=None, retries=0, l7=False, l7_timeout=None,
-            flush_dns=False,
+            dns_csv=None, dns_sample=0, flush_dns=False,
             report=False, microtenant_id=None)
         defaults.update(kw)
         for k, v in defaults.items():
@@ -95,7 +95,7 @@ def main():
     # ---------------------------------------------------------------- parsing
     print("Entry classification")
     check("fqdn", m.classify_entry("app.corp.local") == "fqdn")
-    check("bare ip", m.classify_entry("10.1.2.3") == "ip")
+    check("bare ip", m.classify_entry("192.0.2.30") == "ip")
     check("cidr", m.classify_entry("10.1.0.0/24") == "cidr")
     check("wildcard", m.classify_entry("*.corp.local") == "wildcard")
     check("bad cidr falls back to fqdn",
@@ -215,6 +215,298 @@ def main():
         [{"id": "9", "domainNames": ["a.corp"]}], Args(segment="nomatch"))
     check("--segment filter tolerates missing name",
           st8["segments_matched"] == 0)
+
+    # ------------------------------------------------------ DNS destinations
+    # The export is pre-ZPA ground truth: what each name resolves to with no
+    # Client Connector in the path. It answers the question the segment
+    # inventory cannot — which internal names are NOT enrolled in ZPA.
+    #
+    # The load-bearing property is that this mode invents no ports. An
+    # enterprise-wide record list spans every server role, so a fixed port
+    # set would report a steered database host as TIMEOUT (which the summary
+    # reads as "traffic may not be steered" — the opposite of the truth) and
+    # would amount to a horizontal scan from a managed endpoint.
+    print("\nDNS destinations CSV")
+    _dwork = tempfile.mkdtemp(prefix="zpa-validate-dns-")
+    try:
+        _dhdr = ["SourceFile", "SourceRowNumber", "Name", "ViewName",
+                 "ZoneName", "TTL", "Class", "RecordType", "RDATA",
+                 "IsWildcard", "TerminalName", "CNameHopCount", "CNameChain",
+                 "ChainComplete", "ChainStopReason", "LookupStatus",
+                 "IpCount", "ResolvedIPs", "OnlyExternalIPs",
+                 "HasAnyExternalIP", "HasAnyInternalIP", "ListedIPsFromRDATA",
+                 "ListedIpCountFromRDATA", "ListedOnlyExternalIPs",
+                 "ErrorMessage"]
+
+        def _drec(name, rtype="CNAME", ips="192.0.2.10", ext="FALSE",
+                  internal="TRUE", wild="FALSE", lookup="OK"):
+            d = dict.fromkeys(_dhdr, "")
+            d.update({"SourceFile": "cname-records.csv",
+                      "SourceRowNumber": 1, "Name": name, "TTL": 3600,
+                      "Class": "IN", "RecordType": rtype,
+                      "IsWildcard": wild, "TerminalName": "t-" + name,
+                      "CNameHopCount": 1, "ChainComplete": "TRUE",
+                      "LookupStatus": lookup, "ResolvedIPs": ips,
+                      "OnlyExternalIPs": ext, "HasAnyInternalIP": internal})
+            return d
+
+        _drows = [_drec("in-seg.corp.local"), _drec("gap.corp.local"),
+                  _drec("orphan.corp.local"),
+                  _drec("ext.corp.local", ips="203.0.113.9", ext="TRUE",
+                        internal="FALSE"),
+                  _drec("app.wild.corp", ips="192.0.2.30"),
+                  _drec("*.skip.corp.local", wild="TRUE"),
+                  _drec("txt.corp.local", rtype="TXT"),
+                  _drec("bad.corp.local", lookup="NXDOMAIN"),
+                  _drec("in-seg.corp.local")]
+        _dcsv = os.path.join(_dwork, "dns_destinations.csv")
+        # utf-8-sig: Excel writes a BOM, and an unstripped BOM becomes part
+        # of the first header name and breaks every column lookup.
+        with open(_dcsv, "w", newline="", encoding="utf-8-sig") as _f:
+            _w = csv.DictWriter(_f, fieldnames=_dhdr)
+            _w.writeheader()
+            _w.writerows(_drows)
+
+        _da = Args(dns_csv=_dcsv, dns_sample=0)
+        _dby, _dst = m.load_dns_csv(_dcsv, _da)
+        check("Excel BOM stripped, Name column resolves",
+              "in-seg.corp.local" in _dby, str(sorted(_dby))[:160])
+        check("non-A/CNAME records skipped", _dst["skipped_type"] == 1,
+              _dst["skipped_type"])
+        check("LookupStatus != OK skipped", _dst["skipped_lookup"] == 1)
+        check("wildcards skipped without --wildcard-probe",
+              _dst["skipped_wildcard"] == 1)
+        check("duplicate names collapsed", _dst["duplicates"] == 1)
+        check("wildcard substituted with --wildcard-probe",
+              "www.skip.corp.local" in
+              m.load_dns_csv(_dcsv, Args(wildcard_probe="www"))[0])
+        # Excel on Windows writes cp1252; one smart quote in an
+        # enterprise-wide export must not abort the run.
+        _cp = os.path.join(_dwork, "cp1252.csv")
+        with open(_cp, "w", newline="", encoding="cp1252") as _f:
+            _w2 = csv.DictWriter(_f, fieldnames=_dhdr)
+            _w2.writeheader()
+            _r = _drec("caf\u00e9.corp.local")
+            _r["ZoneName"] = "caf\u00e9 \u2014 zone"
+            _w2.writerow(_r)
+        _cpby, _ = m.load_dns_csv(_cp, _da)
+        check("a cp1252 export loads instead of crashing",
+              "caf\u00e9.corp.local" in _cpby, str(sorted(_cpby)))
+
+        check("booleans parsed from the export",
+              _dby["ext.corp.local"]["only_external"] is True
+              and _dby["gap.corp.local"]["has_internal"] is True)
+        try:
+            _bp = os.path.join(_dwork, "notdns.csv")
+            open(_bp, "w").write("a,b\n1,2\n")
+            m.load_dns_csv(_bp, _da)
+            check("a CSV without a Name column is rejected", False, "no exit")
+        except SystemExit as _e:
+            check("a CSV without a Name column is rejected",
+                  "no 'Name' column" in str(_e), str(_e)[:100])
+        try:
+            m.load_dns_csv(os.path.join(_dwork, "absent.csv"), _da)
+            check("a missing export is rejected", False, "no exit")
+        except SystemExit as _e:
+            check("a missing export is rejected", "not found" in str(_e))
+
+        _dsegs = [{"name": "Seg-A", "id": "1", "enabled": True,
+                   "ipAnchored": True,
+                   "domainNames": ["in-seg.corp.local", "gap.corp.local",
+                                   "ext.corp.local"],
+                   "tcpPortRange": [{"from": "443", "to": "443"},
+                                    {"from": "8000", "to": "8100"}]},
+                  {"name": "Seg-Wild", "id": "2", "enabled": True,
+                   "ipAnchored": True, "domainNames": ["*.wild.corp"],
+                   "tcpPortRanges": ["443", "443"]}]
+        _ex, _wd = m.segment_domain_index(_dsegs, _da)
+        check("exact FQDN matches its segment",
+              m.match_segment("in-seg.corp.local", _ex, _wd)[0] == "Seg-A")
+        check("wildcard parent matches a subdomain",
+              m.match_segment("app.wild.corp", _ex, _wd)[0] == "Seg-Wild")
+        check("a name in no segment matches nothing",
+              m.match_segment("orphan.corp.local", _ex, _wd) == (None, None))
+
+        _dtg, _dbs = m.build_dns_targets(_dby, _dsegs, _da)
+        _dbn = {t["probe_domain"]: t for t in _dtg}
+        check("names in no segment are given NO ports",
+              _dbn["orphan.corp.local"]["ports"] == [],
+              str(_dbn["orphan.corp.local"]["ports"]))
+        check("no target invents a port",
+              all(t["ports"] == [] or t["dns_in_zpa"] for t in _dtg))
+        check("matched names inherit their segment's ports",
+              443 in _dbn["in-seg.corp.local"]["ports"])
+        check("a wide segment range is capped in this mode",
+              len(_dbn["in-seg.corp.local"]["ports"]) <= m.DNS_CSV_PORT_CAP,
+              str(_dbn["in-seg.corp.local"]["ports"]))
+        check("the cap reports what it dropped", _dbs["ports_truncated"] > 0)
+        check("--scope does not thin the export",
+              len(m.build_dns_targets(_dby, _dsegs,
+                                      Args(dns_csv=_dcsv, dns_sample=0,
+                                           scope_resolved="sample"))[0])
+              == len(_dby))
+        check("--dns-sample caps and reports",
+              m.build_dns_targets(_dby, _dsegs,
+                                  Args(dns_csv=_dcsv,
+                                       dns_sample=2))[1]["names_sampled_out"]
+              == len(_dby) - 2)
+        check("with no segments at all, nothing is probed",
+              all(t["ports"] == [] for t in
+                  m.build_dns_targets(_dby, [], _da)[0]))
+
+        # The real-world shape: most records match no segment explicitly
+        # and are caught by a wildcard segment with a broad port range. A
+        # wide range says nothing about what one host listens on, so it
+        # must not become a probe list — expand_ports keeps endpoints
+        # first, so 1-65535 would yield ports 1, 65535, 2, 3.
+        check("discrete ports kept, wide ranges dropped",
+              m.dns_specific_ports(
+                  {"tcpPortRange": [{"from": "443", "to": "443"},
+                                    {"from": "8000", "to": "8100"}]},
+                  4)[0] == [443])
+        check("a segment of only wide ranges yields no ports",
+              m.dns_specific_ports(
+                  {"tcpPortRange": [{"from": "1", "to": "65535"}]},
+                  4)[0] == [])
+        check("dropped ports are counted, not silent",
+              m.dns_specific_ports(
+                  {"tcpPortRange": [{"from": "8000", "to": "8100"}]},
+                  4)[1] == 101)
+        _broad = [{"name": "Wild-Broad", "id": "9", "enabled": True,
+                   "ipAnchored": True, "domainNames": ["*.corp.local"],
+                   "tcpPortRange": [{"from": "1", "to": "65535"}]}]
+        _btg, _bbs = m.build_dns_targets(_dby, _broad, _da)
+        check("a broad wildcard match is NOT probed",
+              all(t["ports"] == [] for t in _btg) and _bbs["probed"] == 0,
+              f"probed={_bbs['probed']}")
+        check("broad matches are counted and attributed to their segment",
+              _bbs["broad_segments"].get("Wild-Broad") == _bbs["matched"],
+              str(_bbs["broad_segments"]))
+        check("wildcard vs exact matches are counted separately",
+              _bbs["matched_wildcard"] == _bbs["matched"]
+              and _bbs["matched_exact"] == 0)
+        _narrow = [{"name": "Wild-Web", "id": "8", "enabled": True,
+                    "ipAnchored": True, "domainNames": ["*.corp.local"],
+                    "tcpPortRanges": ["443", "443", "8443", "8443"]}]
+        _ntg, _nbs = m.build_dns_targets(_dby, _narrow, _da)
+        check("a NARROW wildcard match is still probed",
+              _nbs["probed"] == _nbs["matched"] and _nbs["broad_ports"] == 0,
+              f"probed={_nbs['probed']} broad={_nbs['broad_ports']}")
+        check("range width decides, not whether the match was a wildcard",
+              443 in {p for t in _ntg for p in t["ports"]})
+
+        check("steered verdict",
+              m.dns_verdict_for({"status": "OPEN"}, _dby["in-seg.corp.local"],
+                                True) == "STEERED")
+        check("enrolled but internal is a gap",
+              m.dns_verdict_for({"status": "OPEN"}, _dby["gap.corp.local"],
+                                False) == "NOT_STEERED_INTERNAL")
+        check("external-only is expected, not a gap",
+              m.dns_verdict_for({"status": "OPEN"}, _dby["ext.corp.local"],
+                                False) == "NOT_STEERED_EXTERNAL")
+        check("a DNS failure outranks every other verdict",
+              m.dns_verdict_for({"status": "DNS_FAIL:x"},
+                                _dby["gap.corp.local"], True) == "DNS_FAIL")
+        check("every verdict has a documented meaning",
+              set(m.DNS_VERDICTS) == {"STEERED", "NOT_STEERED_INTERNAL",
+                                      "NOT_STEERED_EXTERNAL",
+                                      "NOT_STEERED_UNKNOWN", "DNS_FAIL"})
+
+        # run_test must tolerate a namespace built before these flags existed
+        # — the failure mode that broke --tenant on export-targets in v1.8.1.
+        check("run_test tolerates args without the dns flags",
+              not hasattr(Args(), "dns_csv")
+              or getattr(Args(), "dns_csv", "missing") is None)
+
+        _drows2 = [{"segment": "Seg-A", "domain": "gap.corp.local",
+                    "probe_domain": "gap.corp.local", "protocol": "tcp",
+                    "status": "OPEN", "zpa_intercepted": False,
+                    "resolved_ip": "192.0.2.10"},
+                   {"segment": "Seg-A", "domain": "gap.corp.local",
+                    "probe_domain": "gap.corp.local", "protocol": "tcp",
+                    "status": "OPEN", "zpa_intercepted": False,
+                    "resolved_ip": "192.0.2.10"},
+                   {"segment": "(not in any ZPA segment)",
+                    "domain": "orphan.corp.local",
+                    "probe_domain": "orphan.corp.local", "protocol": "tcp",
+                    "status": "NO_TCP_PORTS", "zpa_intercepted": False,
+                    "resolved_ip": "192.0.2.99"},
+                   {"segment": "Seg-A", "domain": "in-seg.corp.local",
+                    "probe_domain": "in-seg.corp.local", "protocol": "tcp",
+                    "status": "OPEN", "zpa_intercepted": True,
+                    "resolved_ip": "100.64.1.5"}]
+        m.annotate_dns_rows(_drows2, _dtg)
+        _dx = m.dns_stats(_drows2)
+        check("cross-reference counts names, not probes", _dx["names"] == 3,
+              _dx["names"])
+        check("the steering gap is identified",
+              _dx["steering_gap"] == ["gap.corp.local"],
+              str(_dx["steering_gap"]))
+        check("the enrolment gap is identified",
+              _dx["enrolment_gap"] == ["orphan.corp.local"],
+              str(_dx["enrolment_gap"]))
+        check("dns_stats is None without the export",
+              m.dns_stats([{"status": "OPEN"}]) is None)
+
+        _dhtml = os.path.join(_dwork, "d.html")
+        m.write_html_report(_dhtml, [("post_sample_d.csv", _drows2,
+                                      {"phase": "post", "hostname": "h",
+                                       "zcc": {"state": "running",
+                                               "processes_found": []}})])
+        _dh = open(_dhtml, encoding="utf-8").read()
+        check("report renders the DNS tiles",
+              'data-tilefilter="dnssteered"' in _dh
+              and 'data-tilefilter="dnsgap"' in _dh
+              and 'data-tilefilter="dnsnotinzpa"' in _dh)
+        check("report rows carry the DNS predicates' attributes",
+              'data-dnsv="STEERED"' in _dh and "data-dnszpa=" in _dh)
+        check("report JS reads data-dnsv",
+              "tr.getAttribute('data-dnsv')" in _dh)
+        check("DNS columns appear in the report table",
+              ">dns_verdict<" in _dh)
+        _plain = os.path.join(_dwork, "p.html")
+        m.write_html_report(_plain, [("post_sample_p.csv",
+                                      [{"segment": "S", "domain": "d.corp",
+                                        "probe_domain": "d.corp",
+                                        "status": "OPEN",
+                                        "protocol": "tcp"}], {})])
+        check("no DNS tiles or columns on a non-DNS run",
+              'data-tilefilter="dnssteered"'
+              not in open(_plain, encoding="utf-8").read()
+              and ">dns_verdict<" not in open(_plain, encoding="utf-8").read())
+
+        _dsteps = " ".join(m.next_steps(
+            Args(phase="post"),
+            {"kinds": {"fqdn": 1, "ip": 0, "cidr": 0, "wildcard": 0},
+             "entries_sampled_out": 0, "ports_truncated": 0},
+            [], [], [], None, {"a"}, None, _dx))
+        check("NEXT STEPS raises the steering gap",
+              "enrolled in a ZPA segment" in _dsteps, _dsteps[:160])
+        check("NEXT STEPS raises the enrolment gap",
+              "in no ZPA segment" in _dsteps)
+        check("no DNS steps when the export was not used",
+              "ZPA segment but resolved" not in " ".join(m.next_steps(
+                  Args(phase="post"),
+                  {"kinds": {"fqdn": 1, "ip": 0, "cidr": 0, "wildcard": 0},
+                   "entries_sampled_out": 0, "ports_truncated": 0},
+                  [], [], [], None, {"a"}, None, None)))
+
+        # the cap message must name the cap that actually bound
+        _cov = " ".join(m.coverage_report(
+            {"kinds": {"fqdn": 2, "ip": 0, "cidr": 0, "wildcard": 0},
+             "entries_sampled_out": 0, "ports_truncated": 90},
+            Args(dns_csv=_dcsv), 10))
+        check("the DNS port cap is named honestly in coverage",
+              "--dns-csv caps ports" in _cov and "--scope full" not in _cov,
+              _cov[-140:])
+        _cov2 = " ".join(m.coverage_report(
+            {"kinds": {"fqdn": 2, "ip": 0, "cidr": 0, "wildcard": 0},
+             "entries_sampled_out": 0, "ports_truncated": 90},
+            Args(dns_csv=None), 10))
+        check("a normal run still points at --max-ports",
+              "--max-ports" in _cov2, _cov2[-140:])
+    finally:
+        shutil.rmtree(_dwork, ignore_errors=True)
 
     # ------------------------------------------------------- L7 verification
     # A run can report "249/249 TCP REACHABLE, 0 FAILING PROBES" while most
