@@ -81,7 +81,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-SCRIPT_VERSION = "1.8.1"
+SCRIPT_VERSION = "1.8.2"
 DEFAULT_API_BASE = "https://api.zsapi.net"
 OAUTH_AUDIENCE = "https://api.zscaler.com"
 # Zscaler's documented default synthetic range. It is TENANT-CONFIGURABLE:
@@ -1385,8 +1385,14 @@ def match_segment(host, exact, wild):
 def build_dns_targets(by_name, segments, args):
     """Targets from the DNS export. Ports come only from matched segments."""
     exact, wild = segment_domain_index(segments or [], args)
+    # Whether enrolment could be checked AT ALL. Without an inventory,
+    # "not in a segment" is not a finding — it is an unasked question, and
+    # recording it as False produced a run that reported every steered name
+    # as an enrolment gap while its own verdict said ZPA was steering them.
+    have_segments = bool(exact or wild)
     names = sorted(by_name)
     stats = {"names_total": len(names), "names_sampled_out": 0,
+             "enrolment_checked": have_segments,
              "matched": 0, "unmatched": 0, "ports_truncated": 0,
              "matched_exact": 0, "matched_wildcard": 0,
              "broad_ports": 0, "probed": 0, "broad_segments": {}}
@@ -1427,7 +1433,8 @@ def build_dns_targets(by_name, segments, args):
             if ports:
                 stats["fallback_used"] += 1
                 ordered = not getattr(args, "dns_ports_all", False)
-            seg_label = "(not in any ZPA segment)"
+            seg_label = ("(not in any ZPA segment)" if have_segments
+                         else "(no segment inventory loaded)")
         else:
             stats["matched"] += 1
             stats["matched_wildcard" if via_wild else "matched_exact"] += 1
@@ -1471,7 +1478,9 @@ def build_dns_targets(by_name, segments, args):
             "domain": name,
             "probe_domain": name,
             "dns_ref": by_name[name],
-            "dns_in_zpa": seg is not None,
+            # True / False / "" — the empty string is "not checked", and
+            # every consumer must distinguish it from False.
+            "dns_in_zpa": (seg is not None) if have_segments else "",
             "dns_via_wildcard": via_wild,
             "dns_ordered": ordered,
         })
@@ -1540,22 +1549,40 @@ def dns_stats(rows):
     if not seen:
         return None
 
-    in_zpa = sum(1 for r in seen.values() if r.get("dns_in_zpa") is True)
+    def _in_zpa(row):
+        """True / False / None. None means enrolment was never checked."""
+        v = row.get("dns_in_zpa")
+        if v is True or v == "True":
+            return True
+        if v is False or v == "False":
+            return False
+        return None
+
+    checked = [r for r in seen.values() if _in_zpa(r) is not None]
+    in_zpa = sum(1 for r in checked if _in_zpa(r) is True)
     # An internal name in no ZPA segment cannot be steered — that is an
     # enrolment gap, distinct from a name that is enrolled and still is not
     # being steered.
+    # Only names actually checked can be an enrolment gap. Without an
+    # inventory this list is empty and enrolment_checked is False, so the
+    # summary says "unknown" instead of inventing a coverage finding.
     enrol_gap = [n for n, r in seen.items()
-                 if r.get("dns_in_zpa") is not True
-                 and r.get("dns_has_internal") is True]
+                 if _in_zpa(r) is False
+                 and r.get("dns_has_internal") in (True, "True")]
+    # A name known NOT to be in any segment is expected not to be steered;
+    # that is an enrolment question, not a steering one. Unknown enrolment
+    # still counts, because the verdict itself is the finding.
     steer_gap = [n for n, r in seen.items()
                  if r.get("dns_verdict") == "NOT_STEERED_INTERNAL"
-                 and r.get("dns_in_zpa") is True]
+                 and _in_zpa(r) is not False]
     diverged = [n for n, r in seen.items() if r.get("dns_ip_match") is False
                 and r.get("dns_verdict") != "STEERED"]
     return {
         "names": len(seen),
+        "enrolment_checked": bool(checked),
         "in_zpa": in_zpa,
-        "not_in_zpa": len(seen) - in_zpa,
+        "not_in_zpa": len(checked) - in_zpa,
+        "enrolment_unknown": len(seen) - len(checked),
         "verdicts": verdicts,
         "steered": verdicts.get("STEERED", 0),
         "pct_steered": round(100.0 * verdicts.get("STEERED", 0) / len(seen), 1),
@@ -2075,13 +2102,27 @@ def next_steps(args, stats, action, unverifiable, dns_fail, dns_flush_ok,
             "segments record UDP ports separately (udpPortRange); this tool "
             "lists them as UDP_NOT_PROBED and never probes them.")
     if dstats and dstats["steering_gap"]:
+        # Only claim enrolment when it was actually checked; otherwise the
+        # finding is the observation itself, without the attribution.
+        lead = (f"{len(dstats['steering_gap'])} name(s) are enrolled in a ZPA "
+                "segment but resolved to an internal IP rather than into the "
+                "synthetic range."
+                if dstats.get("enrolment_checked") else
+                f"{len(dstats['steering_gap'])} name(s) resolved to an "
+                "internal IP rather than into the synthetic range. Whether "
+                "they are enrolled is unknown — no segment inventory was "
+                "loaded.")
         steps.append(
-            f"{len(dstats['steering_gap'])} name(s) are enrolled in a ZPA "
-            "segment but resolved to an internal IP rather than into the "
-            "synthetic range. Those are reaching the app outside ZPA — check "
-            "the access policy covers your account for those segments, and "
-            "that no local resolver or /etc/hosts entry is short-circuiting "
-            "Client Connector.")
+            lead + " Those are reaching the app outside ZPA — check the "
+            "access policy covers your account, and that no local resolver "
+            "or /etc/hosts entry is short-circuiting Client Connector.")
+    if dstats and not dstats.get("enrolment_checked"):
+        steps.append(
+            "Enrolment was not checked: this run had no segment inventory to "
+            "join against, so the export could only answer which names are "
+            "being steered — not which are enrolled. Re-run with "
+            "--targets-file zpa-targets.json (or credentials) to get the "
+            "coverage answer the export exists to provide.")
     if dstats and dstats["enrolment_gap"]:
         steps.append(
             f"{len(dstats['enrolment_gap'])} internal name(s) in the DNS "
@@ -2740,8 +2781,14 @@ def run_test(args):
     if dstats:
         print(_section("DNS CROSS-REFERENCE (export vs endpoint)"))
         print(f"    names checked  {dstats['names']:>6}")
-        print(f"    in a ZPA segment {dstats['in_zpa']:>4}   "
-              f"in none {dstats['not_in_zpa']:>6}")
+        if dstats["enrolment_checked"]:
+            print(f"    in a ZPA segment {dstats['in_zpa']:>4}   "
+                  f"in none {dstats['not_in_zpa']:>6}")
+        else:
+            print("    in a ZPA segment  UNKNOWN — no segment inventory was "
+                  "loaded, so enrolment")
+            print("                      was never checked. Add "
+                  "--targets-file for the ZPA join.")
         print(f"    steered        {dstats['steered']:>6}  "
               f"({dstats['pct_steered']}% of names)")
         print("\n    verdicts:")
@@ -3131,7 +3178,7 @@ HTML_JS = """
     l7unverified: function(d){ return l7ran(d) && !l7ok(d); },
     dnssteered:   function(d){ return d.dnsv === 'STEERED'; },
     dnsgap:       function(d){ return d.dnsv === 'NOT_STEERED_INTERNAL'; },
-    dnsnotinzpa:  function(d){ return d.dnsv !== '' && d.dnszpa !== 'True'
+    dnsnotinzpa:  function(d){ return d.dnsv !== '' && d.dnszpa === 'False'
                                      && d.dnsint === 'True'; }
   };
   var LABEL = {
@@ -3352,9 +3399,12 @@ def write_html_report(out_path, runs, diff=None):
                     continue
                 seen_names.add(nm)
                 dv[r["dns_verdict"]] = dv.get(r["dns_verdict"], 0) + 1
-                if str(r.get("dns_in_zpa")) != "True" \
+                # "" is not-checked and must not count as an enrolment gap
+                if str(r.get("dns_in_zpa")) == "False" \
                         and str(r.get("dns_has_internal")) == "True":
                     dv["_enrol"] = dv.get("_enrol", 0) + 1
+                if str(r.get("dns_in_zpa")) not in ("True", "False"):
+                    dv["_unknown"] = dv.get("_unknown", 0) + 1
             steered_n = dv.get("STEERED", 0)
             gap_n = dv.get("NOT_STEERED_INTERNAL", 0)
             parts.append(_tile(f"{steered_n}/{len(seen_names)}",
@@ -3363,9 +3413,15 @@ def write_html_report(out_path, runs, diff=None):
                                filt="dnssteered"))
             parts.append(_tile(gap_n, "not steered (internal)",
                                "bad" if gap_n else "ok", filt="dnsgap"))
-            parts.append(_tile(dv.get("_enrol", 0), "internal, not in ZPA",
-                               "warn" if dv.get("_enrol") else "ok",
-                               filt="dnsnotinzpa"))
+            if dv.get("_unknown"):
+                # A count here would read as a coverage finding. It is not
+                # one: nothing was checked.
+                parts.append(_tile("n/a", "enrolment not checked", "info"))
+            else:
+                parts.append(_tile(dv.get("_enrol", 0),
+                                   "internal, not in ZPA",
+                                   "warn" if dv.get("_enrol") else "ok",
+                                   filt="dnsnotinzpa"))
         lat_m = (meta.get("latency") or {}).get("median_ms")
         if lat_m is not None:
             # a median is not a row set — deliberately not a filter

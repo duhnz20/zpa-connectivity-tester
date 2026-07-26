@@ -1,5 +1,31 @@
 # Changelog
 
+## v1.8.2
+Fixes a false finding that contradicted the run's own verdict.
+
+A `--dns-csv` run without a segment source reported every name as an
+enrolment gap — including the ones ZPA was demonstrably steering. On a real
+export that read as `ZPA IS STEERING — 1421 domains` in the verdict and
+`ENROLMENT GAP (1458) — in no ZPA segment at all` twenty lines below it, with
+each CSV row carrying `dns_in_zpa=False` next to `dns_verdict=STEERED`.
+
+- **`dns_in_zpa` is now tri-state.** `False` means checked and absent; `""`
+  means never checked, which is what an absent segment inventory actually
+  produces. Recording "unasked" as "absent" is what manufactured the finding.
+- The enrolment gap, its report tile, its click-to-filter predicate and its
+  `NEXT STEPS` entry all now require enrolment to have been *checked*. When
+  it was not, the summary says `UNKNOWN — no segment inventory was loaded`,
+  the tile reads `n/a`, and `NEXT STEPS` tells you to add `--targets-file`
+  rather than inventing a coverage number.
+- The segment column reads `(no segment inventory loaded)` instead of
+  `(not in any ZPA segment)` when nothing was loaded to match against.
+- A name known absent from every segment is no longer counted as a
+  *steering* gap — not being steered is the expected consequence of not
+  being enrolled, and conflating the two hid the real cases.
+- Names whose enrolment is unknown still surface when they resolve to an
+  internal IP instead of into ZPA; the wording just no longer claims they
+  are enrolled.
+
 ## v1.8.1
 Ordered probes and a sharper scan warning.
 

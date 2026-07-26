@@ -553,6 +553,94 @@ def main():
                                        dns_ports_all=True))[0][0]
               ["dns_ordered"] is False)
 
+        # Regression for a real-run bug: with no --targets-file the tool
+        # recorded dns_in_zpa=False for every name, so a run whose own
+        # verdict said "ZPA IS STEERING 1421 domains" simultaneously
+        # reported 1458 names as an enrolment gap. False means "checked and
+        # absent"; not-checked has to be a third state.
+        _ntg, _nbs = m.build_dns_targets(_dby, [], _da)
+        check("no inventory -> enrolment_checked is False",
+              _nbs["enrolment_checked"] is False)
+        check("no inventory -> dns_in_zpa is unknown, not False",
+              all(t["dns_in_zpa"] == "" for t in _ntg),
+              str({t["dns_in_zpa"] for t in _ntg}))
+        check("no inventory -> the segment label says so",
+              all(t["segment"] == "(no segment inventory loaded)"
+                  for t in _ntg))
+        check("with an inventory, dns_in_zpa is a real boolean",
+              {t["dns_in_zpa"] for t in _dtg} == {True, False})
+
+        def _erow(name, verdict, in_zpa, internal=True):
+            return {"segment": "s", "domain": name, "probe_domain": name,
+                    "protocol": "tcp", "status": "OPEN",
+                    "zpa_intercepted": verdict == "STEERED",
+                    "resolved_ip": "100.64.1.1", "dns_verdict": verdict,
+                    "dns_in_zpa": in_zpa, "dns_has_internal": internal,
+                    "dns_ip_match": False}
+
+        _unk = ([_erow(f"h{i}.corp.local", "STEERED", "") for i in range(20)]
+                + [_erow("g.corp.local", "NOT_STEERED_INTERNAL", "")])
+        _du = m.dns_stats(_unk)
+        check("unknown enrolment produces NO enrolment gap",
+              _du["enrolment_gap"] == [], str(_du["enrolment_gap"])[:80])
+        check("unknown enrolment is counted as unknown",
+              _du["enrolment_unknown"] == 21, _du["enrolment_unknown"])
+        check("steering is still reported under unknown enrolment",
+              _du["steered"] == 20, _du["steered"])
+        check("not-steered-internal still surfaces under unknown enrolment",
+              _du["steering_gap"] == ["g.corp.local"],
+              str(_du["steering_gap"]))
+        check("a steered name is never an enrolment gap",
+              not any(n.startswith("h") for n in _du["enrolment_gap"]))
+
+        _kn = [_erow("in.corp.local", "STEERED", True),
+               _erow("out.corp.local", "NOT_STEERED_INTERNAL", False),
+               _erow("gap.corp.local", "NOT_STEERED_INTERNAL", True)]
+        _dk = m.dns_stats(_kn)
+        check("checked enrolment still finds the real gap",
+              _dk["enrolment_gap"] == ["out.corp.local"],
+              str(_dk["enrolment_gap"]))
+        check("a name known absent from ZPA is not a STEERING gap",
+              _dk["steering_gap"] == ["gap.corp.local"],
+              str(_dk["steering_gap"]))
+        check("CSV string booleans read the same as python bools",
+              m.dns_stats([{**_erow("x.corp.local", "STEERED", "False"),
+                            "dns_has_internal": "True"}])["enrolment_gap"]
+              == ["x.corp.local"])
+
+        _est = {"kinds": {"fqdn": 1, "ip": 0, "cidr": 0, "wildcard": 0},
+                "entries_sampled_out": 0, "ports_truncated": 0}
+        _su = " ".join(m.next_steps(Args(), _est, [], [], [], None, {"a"},
+                                    None, _du))
+        check("NEXT STEPS says enrolment was not checked",
+              "Enrolment was not checked" in _su, _su[:140])
+        check("NEXT STEPS does NOT claim a coverage gap when unchecked",
+              "in no ZPA segment" not in _su, _su[:180])
+        check("NEXT STEPS still claims the gap when it was checked",
+              "in no ZPA segment" in " ".join(m.next_steps(
+                  Args(), _est, [], [], [], None, {"a"}, None, _dk)))
+
+        _uh = os.path.join(_dwork, "unk.html")
+        m.write_html_report(_uh, [("post_sample_u.csv", _unk,
+                                   {"phase": "post", "hostname": "h",
+                                    "zcc": {"state": "running",
+                                            "processes_found": []}})])
+        check("tile reads n/a, not a count, when enrolment was unchecked",
+              "enrolment not checked" in open(_uh, encoding="utf-8").read()
+              and 'data-tilefilter="dnsnotinzpa"'
+              not in open(_uh, encoding="utf-8").read())
+
+        check("steering-gap wording does not assert enrolment when "
+              "unchecked",
+              "enrolled in a ZPA segment" not in " ".join(m.next_steps(
+                  Args(), _est, [], [], [], None, {"a"}, None, _du))
+              and "Whether\nthey are enrolled is unknown".replace("\n", " ")
+              in " ".join(m.next_steps(Args(), _est, [], [], [], None,
+                                       {"a"}, None, _du)))
+        check("steering-gap wording does assert enrolment when checked",
+              "enrolled in a ZPA segment" in " ".join(m.next_steps(
+                  Args(), _est, [], [], [], None, {"a"}, None, _dk)))
+
         check("steered verdict",
               m.dns_verdict_for({"status": "OPEN"}, _dby["in-seg.corp.local"],
                                 True) == "STEERED")
