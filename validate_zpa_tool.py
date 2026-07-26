@@ -60,7 +60,8 @@ class Args:
             ca_bundle=None, client_id=None, vanity_domain=None,
             customer_id=None, api_base="https://api.zsapi.net",
             targets_file=None, retries=0, l7=False, l7_timeout=None,
-            dns_csv=None, dns_sample=0, flush_dns=False,
+            dns_csv=None, dns_sample=0, dns_ports=None,
+            flush_dns=False,
             report=False, microtenant_id=None)
         defaults.update(kw)
         for k, v in defaults.items():
@@ -394,6 +395,92 @@ def main():
               f"probed={_nbs['probed']} broad={_nbs['broad_ports']}")
         check("range width decides, not whether the match was a wildcard",
               443 in {p for t in _ntg for p in t["ports"]})
+
+        # --dns-ports: an explicit fallback for names the segments cannot
+        # supply a port for. The load-bearing warning is that a TCP probe to
+        # a UDP service times out on a healthy host, and this tool reads
+        # TIMEOUT as "traffic may not be steered".
+        check("--dns-ports parses a list",
+              m.parse_dns_ports("111,123,161") == [111, 123, 161])
+        check("--dns-ports dedupes and tolerates spaces",
+              m.parse_dns_ports(" 111, 111 ,123 ") == [111, 123])
+        check("--dns-ports empty means none",
+              m.parse_dns_ports(None) == [] and m.parse_dns_ports("") == [])
+        for _bad, _why in (("111,abc", "non-numeric"), ("0", "zero"),
+                           ("70000", "out of range")):
+            try:
+                m.parse_dns_ports(_bad)
+                check(f"--dns-ports rejects {_why}", False, "no exit")
+            except SystemExit as _e:
+                check(f"--dns-ports rejects {_why}", "--dns-ports" in str(_e))
+        check("UDP-primary services are recognised",
+              m.udp_primary_in([111, 123, 161])
+              == [(123, "NTP"), (161, "SNMP")],
+              str(m.udp_primary_in([111, 123, 161])))
+        check("111 is not flagged UDP-primary (rpcbind serves TCP too)",
+              111 not in m.UDP_PRIMARY_PORTS)
+        check("53 is not flagged UDP-primary (DNS serves TCP too)",
+              53 not in m.UDP_PRIMARY_PORTS)
+
+        _fb = Args(dns_csv=_dcsv, dns_sample=0, dns_ports="111,123,161")
+        _ftg, _fbs = m.build_dns_targets(_dby, _dsegs, _fb)
+        _fbn = {t["probe_domain"]: t for t in _ftg}
+        check("an unmatched name takes the fallback ports",
+              _fbn["orphan.corp.local"]["ports"] == [111, 123, 161],
+              str(_fbn["orphan.corp.local"]["ports"]))
+        check("a segment with discrete ports is never overridden",
+              _fbn["in-seg.corp.local"]["ports"] == [443],
+              str(_fbn["in-seg.corp.local"]["ports"]))
+        check("fallback usage is counted", _fbs["fallback_used"] >= 1)
+        _budp = [{"name": "Wild-Broad", "id": "9", "enabled": True,
+                  "ipAnchored": True, "domainNames": ["*.corp.local"],
+                  "tcpPortRange": [{"from": "1", "to": "65535"}],
+                  "udpPortRange": [{"from": "123", "to": "123"},
+                                   {"from": "161", "to": "161"}]}]
+        _utg, _ubs = m.build_dns_targets(_dby, _budp, _fb)
+        check("a broad match falls back to --dns-ports",
+              all(t["ports"] == [111, 123, 161] for t in _utg))
+        check("ZPA's own udpPortRange confirms which fallbacks are UDP",
+              sorted(_ubs["udp_confirmed"]) == [123, 161],
+              str(_ubs["udp_confirmed"]))
+        check("without --dns-ports a broad match stays unprobed",
+              all(t["ports"] == [] for t in
+                  m.build_dns_targets(_dby, _budp, _da)[0]))
+        _ust = {"kinds": {"fqdn": 1, "ip": 0, "cidr": 0, "wildcard": 0},
+                "entries_sampled_out": 0, "ports_truncated": 0}
+        _uw = " ".join(m.next_steps(_fb, _ust, [], [], [], None, {"a"},
+                                    None, None))
+        check("NEXT STEPS warns 123/161 are UDP services",
+              "123/tcp (NTP)" in _uw and "161/tcp (SNMP)" in _uw, _uw[:160])
+        check("NEXT STEPS says to read those as not-tested",
+              "not as failures" in _uw)
+        check("no UDP warning for a TCP-only --dns-ports",
+              "run over UDP" not in " ".join(m.next_steps(
+                  Args(dns_csv=_dcsv, dns_ports="111,443"), _ust, [], [], [],
+                  None, {"a"}, None, None)))
+
+        # A general guard for a bug class that has now recurred three
+        # times: a summary helper reading args.<newflag> directly, which
+        # explodes for any caller that built its namespace before the flag
+        # existed. Assert the whole family survives a bare namespace.
+        class _Bare:
+            phase = "post"
+            wildcard_probe = None
+            sample_domains = 3
+            cidr_hosts = 5
+            max_ports = 10
+            timeout = 2.0
+
+        _bst = {"kinds": {"fqdn": 1, "ip": 0, "cidr": 0, "wildcard": 0},
+                "entries_sampled_out": 0, "ports_truncated": 1}
+        try:
+            m.next_steps(_Bare(), _bst, [], [], [], None, set())
+            m.coverage_report(_bst, _Bare(), 1)
+            check("summary helpers tolerate a namespace without the new "
+                  "flags", True)
+        except AttributeError as _e:
+            check("summary helpers tolerate a namespace without the new "
+                  "flags", False, str(_e))
 
         check("steered verdict",
               m.dns_verdict_for({"status": "OPEN"}, _dby["in-seg.corp.local"],

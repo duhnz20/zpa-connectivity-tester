@@ -2,7 +2,7 @@
 
 ## v1.8.0
 Drive a run from an enterprise DNS export and cross-reference it against the
-ZPA segment inventory. Validated 296/296 on Linux, up from 247/247, plus 80/80 on a new
+ZPA segment inventory. Validated 315/315 on Linux, up from 247/247, plus 101/101 on a new
 --dns-csv regression suite.
 
 The segment inventory says what ZPA is *configured* to steer. A DNS export
@@ -36,6 +36,22 @@ alone: which internal names are not enrolled in ZPA at all.
   answered — traffic may not be steered": the exact opposite of the truth.
   It would also constitute a horizontal port scan across the enterprise from
   a managed endpoint.
+- **`--dns-ports PORTS`** names TCP ports for records the segments cannot
+  supply one for. It never overrides a segment that defines discrete ports,
+  and the default is still none. Ports whose service is UDP (123 NTP, 161
+  SNMP, 514 syslog, ...) are flagged at startup and in NEXT STEPS: this tool
+  probes TCP only, so a connect there times out on a healthy host and the
+  summary would read that TIMEOUT as "traffic may not be steered" — a
+  protocol mismatch turned into a false ZPA finding on every host. Each
+  requested port is also cross-checked against the matched segment's own
+  `udpPortRange`, which is direct evidence from ZPA rather than an inference
+  from a well-known-ports table. The run states the resulting connect
+  volume, because a fixed port set across a whole export is a horizontal
+  scan and 111/161 are classic enumeration signatures.
+- Fixed: `next_steps` read `args.dns_csv` directly, the third recurrence of
+  the attribute-access bug that broke `--tenant` in v1.8.1. All summary
+  helpers now tolerate a namespace assembled without the newer flags, with a
+  general regression guard rather than one check per flag.
 - **Two gaps, reported separately.** *Steering gap* — enrolled in a segment
   but resolved to an internal IP rather than into the synthetic range.
   *Enrolment gap* — internal in DNS and in no segment at all, so it cannot

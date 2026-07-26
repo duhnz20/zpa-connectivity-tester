@@ -1114,6 +1114,55 @@ DNS_CSV_PORT_CAP = 4
 DNS_CSV_MAX_RANGE_SPAN = 4
 
 
+# Ports whose service is UDP in normal deployment. A TCP connect to one of
+# these times out on a perfectly healthy host, so a TCP-only probe reports
+# the service as unreachable when it is running fine — and this tool's
+# summary classifies TIMEOUT as "nothing answered, traffic may not be
+# steered", which turns a protocol mismatch into a false ZPA finding.
+#
+# 53 is deliberately absent: DNS runs on TCP as well as UDP, so a TCP probe
+# there is meaningful.
+UDP_PRIMARY_PORTS = {
+    69: "TFTP", 123: "NTP", 137: "NetBIOS name", 138: "NetBIOS datagram",
+    161: "SNMP", 162: "SNMP trap", 500: "IKE", 514: "syslog",
+    1900: "SSDP", 4500: "IPsec NAT-T", 5353: "mDNS",
+}
+
+
+def parse_dns_ports(value):
+    """Parse --dns-ports, or exit with a usable message."""
+    if not value:
+        return []
+    ports = []
+    for part in str(value).replace(" ", "").split(","):
+        if not part:
+            continue
+        try:
+            p = int(part)
+        except ValueError:
+            sys.exit(f"ERROR: --dns-ports {part!r} is not a port number.")
+        if not 1 <= p <= 65535:
+            sys.exit(f"ERROR: --dns-ports {p} is out of range (1-65535).")
+        if p not in ports:
+            ports.append(p)
+    return ports
+
+
+def dns_ports_for(args):
+    """--dns-ports resolved once and cached on args."""
+    cached = getattr(args, "dns_ports_resolved", None)
+    if cached is not None:
+        return cached
+    ports = parse_dns_ports(getattr(args, "dns_ports", None))
+    args.dns_ports_resolved = ports
+    return ports
+
+
+def udp_primary_in(ports):
+    """[(port, service)] for ports a TCP probe cannot meaningfully test."""
+    return [(p, UDP_PRIMARY_PORTS[p]) for p in ports if p in UDP_PRIMARY_PORTS]
+
+
 def dns_specific_ports(seg, cap):
     """(ports, dropped) — only the ports that actually identify a service.
 
@@ -1330,6 +1379,14 @@ def build_dns_targets(by_name, segments, args):
         names = keep
 
     cap = min(DNS_CSV_PORT_CAP, args.max_ports or DNS_CSV_PORT_CAP)
+    # Fallback ports are used only where the segment supplied no specific
+    # evidence — a broad-range match, or no match at all. They never
+    # override a segment that does define discrete ports.
+    fallback = dns_ports_for(args)
+    stats["fallback_ports"] = list(fallback)
+    stats["fallback_used"] = 0
+    stats["udp_primary"] = udp_primary_in(fallback)
+    stats["udp_confirmed"] = {}
     # Port breadth is a property of the segment, not of the name, so it is
     # measured once per segment rather than per record.
     breadth = {}
@@ -1339,7 +1396,9 @@ def build_dns_targets(by_name, segments, args):
         via_wild = seg is not None and name not in exact
         if seg is None:
             stats["unmatched"] += 1
-            ports, udp = [], []
+            ports, udp = list(fallback), []
+            if ports:
+                stats["fallback_used"] += 1
             seg_label = "(not in any ZPA segment)"
         else:
             stats["matched"] += 1
@@ -1354,11 +1413,22 @@ def build_dns_targets(by_name, segments, args):
                 stats["probed"] += 1
             else:
                 # Nominally matched, but every range the segment defines is
-                # too wide to say anything about this host. Resolve only,
-                # and record which segment caused it so the run can say so.
+                # too wide to say anything about this host. Record which
+                # segment caused it, then fall back if one was configured.
                 stats["broad_ports"] += 1
                 stats["broad_segments"][seg_name] = \
                     stats["broad_segments"].get(seg_name, 0) + 1
+                if fallback:
+                    ports = list(fallback)
+                    stats["fallback_used"] += 1
+                    # The segment's own UDP definition is direct evidence
+                    # that a fallback port is UDP here, not a guess from a
+                    # well-known-ports table.
+                    for lo, hi in port_ranges(seg, "udpPortRange"):
+                        for p in fallback:
+                            if lo <= p <= hi:
+                                stats["udp_confirmed"].setdefault(
+                                    p, set()).add(seg_name)
             udp = []
             seg_label = seg_name
         targets.append({
@@ -1929,6 +1999,22 @@ def next_steps(args, stats, action, unverifiable, dns_fail, dns_flush_ok,
             f"{len(unverifiable)} probe(s) across {len(segs)} segment(s) were "
             "IP/CIDR entries, which cannot prove steering from an endpoint "
             "(caveat 1). Confirm them in the ZPA admin portal's access logs.")
+    # getattr, not attribute access: next_steps is called by tests and by
+    # any caller assembling its own namespace. Reading args.dns_csv directly
+    # is the same failure that broke --tenant on export-targets in v1.8.1,
+    # and it has now recurred twice more in this feature.
+    udp_ports = (udp_primary_in(dns_ports_for(args))
+                 if getattr(args, "dns_csv", None) else [])
+    if udp_ports:
+        named = ", ".join(f"{p}/tcp ({svc})" for p, svc in udp_ports)
+        steps.append(
+            f"{named} were probed over TCP, but those services run over UDP. "
+            "A timeout there says nothing about reachability or steering — "
+            "the host may be answering perfectly on UDP. Read those rows as "
+            "'not tested', not as failures, and drop them from --dns-ports "
+            "unless you know the service is bound to TCP as well. ZPA "
+            "segments record UDP ports separately (udpPortRange); this tool "
+            "lists them as UDP_NOT_PROBED and never probes them.")
     if dstats and dstats["steering_gap"]:
         steps.append(
             f"{len(dstats['steering_gap'])} name(s) are enrolled in a ZPA "
@@ -2220,6 +2306,7 @@ def run_test(args):
     # which is exactly how --tenant broke on export-targets in v1.8.1.
     args.dns_csv = getattr(args, "dns_csv", None)
     args.dns_sample = getattr(args, "dns_sample", 0)
+    args.dns_ports = getattr(args, "dns_ports", None)
 
     # With --dns-csv and no segment source, the run is a resolution sweep:
     # it still answers which names are steered, it just has nothing to join
@@ -2303,14 +2390,36 @@ def run_test(args):
             for sname, n in sorted(dns_build["broad_segments"].items(),
                                    key=lambda kv: -kv[1])[:5]:
                 print(f"      {sname[:52]:<52} {n:>6} name(s)")
-        print(f"    {dns_build['unmatched']} matched no segment — resolved, "
+        print(f"    {dns_build['unmatched']} matched no segment"
+              + (" — resolved, NOT probed (no guessed ports, no scan "
+                 "footprint)" if not dns_build["fallback_ports"] else ""))
+        if dns_build["fallback_ports"]:
+            plist = ",".join(str(p) for p in dns_build["fallback_ports"])
+            print(f"    {dns_build['fallback_used']} name(s) given "
+                  f"--dns-ports {plist} because their segment supplied no "
+                  "specific port")
+            if dns_build["udp_primary"]:
+                names = ", ".join(f"{p}/tcp ({svc})"
+                                  for p, svc in dns_build["udp_primary"])
+                print(f"    [!] {names} — these services run over UDP. A TCP "
+                      "connect to them times out on a")
+                print("        perfectly healthy host, and this tool reads "
+                      "TIMEOUT as 'traffic may not be")
+                print("        steered'. Expect failures there that are not "
+                      "failures.")
+            for p, segs in sorted(dns_build["udp_confirmed"].items()):
+                print(f"    [!] port {p} is defined as UDP by "
+                      f"{len(segs)} matched segment(s) — confirmed by ZPA, "
+                      "not inferred")
+            print(f"    [!] {dns_build['fallback_used']} names x "
+                  f"{len(dns_build['fallback_ports'])} ports = "
+                  f"{dns_build['fallback_used'] * len(dns_build['fallback_ports'])}"
+                  " connects across the estate. Ports 111/161 in particular "
+                  "are")
+            print("        classic enumeration signatures; tell whoever "
+                  "watches IDS before running this.")
+        print("    steering is settled — resolved, "
               "NOT probed (no guessed ports, no scan footprint)")
-        print("    steering is settled by resolution, so coverage is "
-              "complete either way")
-        if dns_standalone:
-            print("    [!] no segment source given, so nothing could be "
-                  "matched — this is a resolution-only sweep. Add "
-                  "--targets-file for the ZPA join.")
     print(f"[*] Segments matched: {stats['segments_matched']}")
     print(f"[*] Entries: {stats['entries_total']} total "
           f"({k['fqdn']} fqdn, {k['ip']} ip, {k['cidr']} cidr, "
@@ -2483,7 +2592,11 @@ def run_test(args):
         "latency": lat,
         "l7": l7s,
         "dns_csv": (None if not args.dns_csv else
-                    {"path": dns_path, "load": dns_load, "build": dns_build,
+                    {"path": dns_path, "load": dns_load,
+                     "build": {k: (sorted(v) if isinstance(v, set) else
+                                   {kk: sorted(vv) for kk, vv in v.items()}
+                                   if k == "udp_confirmed" else v)
+                               for k, v in dns_build.items()},
                      "crossref": dstats}),
         "slowest_segments": [{"segment": s, "median_ms": m, "probes": n}
                              for s, m, n in slowest_segments(all_rows)],
@@ -3678,6 +3791,17 @@ def main():
                         "no scan footprint. Combine with --targets-file (or "
                         "credentials) for the segment join; without one it "
                         "is a resolution-only sweep")
+    t.add_argument("--dns-ports", metavar="PORTS",
+                   help="[--dns-csv] comma-separated TCP ports to probe on "
+                        "names whose matched segment supplied no specific "
+                        "port (a wide range) or that matched no segment. "
+                        "Default: none — those names are resolved only. "
+                        "Never overrides a segment that defines discrete "
+                        "ports. Ports whose service is UDP (123 NTP, 161 "
+                        "SNMP, ...) are flagged: a TCP probe there times out "
+                        "on a healthy host. Probing a fixed set across a "
+                        "whole DNS export is a horizontal scan — notify "
+                        "whoever watches IDS first")
     t.add_argument("--dns-sample", type=int, default=0, metavar="N",
                    help="cap the DNS export at N names (default 0 = every "
                         "record). --scope does not thin this list: sampling "

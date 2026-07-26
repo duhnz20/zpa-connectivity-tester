@@ -305,6 +305,37 @@ coverage is complete whether or not a single connect is made. The run
 reports how many names matched by exact name, how many via a wildcard, and
 how many were left unprobed because their segment's ranges were too wide.
 
+### If you do want ports probed: `--dns-ports`
+
+For names the segments cannot supply a port for, you can name ports
+explicitly. It never overrides a segment that defines discrete ports:
+
+```bash
+--dns-csv --dns-ports 111,123,161
+```
+
+**Check the protocol first.** Of that example set, only 111 (rpcbind) is
+normally a TCP service. 123 (NTP) and 161 (SNMP) are UDP, and this tool
+probes TCP only — so a TCP connect to them times out on a perfectly healthy,
+correctly steered host, and the summary classifies `TIMEOUT` as *"nothing
+answered, traffic may not be steered"*. That turns a protocol mismatch into
+a false ZPA finding on every host you own.
+
+The run warns about this at startup, cross-checks each port against the
+matched segment's own `udpPortRange` — direct evidence from ZPA rather than
+a guess from a well-known-ports table — and adds a `NEXT STEPS` entry saying
+to read those rows as *not tested* rather than as failures.
+
+ZPA records UDP ports separately. This tool lists them as `UDP_NOT_PROBED`
+and never probes them, so UDP reachability is not something a run can
+currently answer either way.
+
+Note the volume: names x ports connects across the estate. Ports 111 and 161
+in particular are classic enumeration signatures. Tell whoever watches IDS
+before running it.
+
+---
+
 ### What it finds
 
 ```
@@ -437,7 +468,7 @@ report           build HTML from one or two CSVs  [--out]
 
 Useful `test` flags: `--segment SUBSTR`, `--enabled-only`,
 `--wildcard-probe www`, `--sample-domains N`, `--cidr-hosts N`,
-`--max-ports N`, `--retries N`, `--l7`, `--l7-timeout S`, `--dns-csv [CSV]`, `--dns-sample N`, `--flush-dns`, `--report`,
+`--max-ports N`, `--retries N`, `--l7`, `--l7-timeout S`, `--dns-csv [CSV]`, `--dns-ports PORTS`, `--dns-sample N`, `--flush-dns`, `--report`,
 `--timeout S`, `--workers N` (keep under ~200 on macOS, FD limit 256),
 `--no-show-failures`,
 `--ca-bundle PEM`, `--yes`.
