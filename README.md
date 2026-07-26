@@ -217,11 +217,40 @@ path is printed at the end of every run.
 | `zpa_intercepted` | `True` = resolved into `100.64.0.0/10` → ZCC steered it into ZPA. `N/A` for ip/cidr — see caveat 1 |
 | `status` | `OPEN`, `OPEN_FLAKY` (only succeeded on retry), `REFUSED`, `TIMEOUT`, `DNS_FAIL:…`, `UDP_NOT_PROBED`, `WILDCARD_SKIPPED` |
 | `attempts` | How many tries the result took |
-| `l7_result` | With `--l7`: `TLS:TLSv1.3`, `HTTP:200`, etc. — proof an app answered, not just TCP |
+| `l7_result` | With `--l7`. `TLS:…` / `HTTP:…` prove an application answered. `OPEN_NO_L7_DATA` = accepted then sent nothing (typically nothing serving behind the App Connector). `OPEN_NON_HTTP` = a live service this probe cannot speak to. `L7_ERROR:…` = the exchange failed — raise `--l7-timeout` before reading these as application faults |
 
 **The signal ZPA is working:** post-run `zpa_intercepted` flips to `True`
 for FQDN segments while `status` stays `OPEN`. The compare output's
 "newly intercepted domains" is the headline number.
+
+---
+
+### TCP reachable is not an application pass
+
+Through ZPA the TCP connection is accepted **locally by Client Connector**,
+so a port reads as `OPEN` whether or not anything behind the App Connector
+is serving. A run can therefore report `249/249 TCP REACHABLE` and
+`0 FAILING PROBES` while most of those probes had nothing on the other end.
+
+`--l7` is what separates the two, and its result is now in the summary:
+
+```
+  RESULTS   OPEN 249  WILDCARD_SKIPPED 15
+  L7        107/249 OPEN probes had an application respond (43.0%)
+```
+
+with an `L7 VERIFICATION` section breaking that down per outcome and per
+segment, two clickable tiles in the HTML report (`L7 verified`, `no app
+response`), and an `l7` block in the run's `meta.json`.
+
+The L7 step has its own timeout. A ZPA connect completes locally and fast,
+so `--timeout` is tuned low, but a TLS handshake has to traverse the App
+Connector to the backend — sharing one budget reports working applications
+as L7 timeouts. `--l7-timeout` defaults to 4x `--timeout`, clamped to
+5-15s; pass it explicitly to go outside that range.
+
+If raising it does not move the numbers, the finding is real: those
+segments have nothing answering.
 
 ---
 
@@ -325,7 +354,7 @@ report           build HTML from one or two CSVs  [--out]
 
 Useful `test` flags: `--segment SUBSTR`, `--enabled-only`,
 `--wildcard-probe www`, `--sample-domains N`, `--cidr-hosts N`,
-`--max-ports N`, `--retries N`, `--l7`, `--flush-dns`, `--report`,
+`--max-ports N`, `--retries N`, `--l7`, `--l7-timeout S`, `--flush-dns`, `--report`,
 `--timeout S`, `--workers N` (keep under ~200 on macOS, FD limit 256),
 `--no-show-failures`,
 `--ca-bundle PEM`, `--yes`.

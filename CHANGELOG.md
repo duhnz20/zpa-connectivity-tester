@@ -1,5 +1,51 @@
 # Changelog
 
+## v1.7.0
+L7 verification reaches the summary, and three measurement fixes behind it.
+Validated 247/247 on Linux.
+
+A run can report `249/249 TCP REACHABLE`, `0 FAILING PROBES` and
+`0 actionable findings` while fewer than half of those probes had an
+application respond. Every number in that headline is correct; none of them
+says so.
+
+- **`--l7` results now appear in the summary and the report.** The data was
+  already written to every CSV, but nothing that summarised a run mentioned
+  it: no console line, no HTML tile, and `FINDINGS` printed "every probed
+  entry behaved as expected" on the strength of the TCP result alone. There
+  is now an `L7` line beside `RESULTS`, an `L7 VERIFICATION` section with a
+  per-outcome breakdown and per-segment attribution, two clickable report
+  tiles (`L7 verified`, `no app response`), an `l7` block in `meta.json`,
+  and a `NEXT STEPS` entry. `FINDINGS` no longer claims a clean pass when
+  the L7 step disagrees.
+- **Why the distinction matters.** Through ZPA a TCP connection is accepted
+  locally by Client Connector, so a port reads as `OPEN` whether or not
+  anything behind the App Connector is serving. Reachability is not an
+  application pass, and the tool now says so rather than implying otherwise.
+- **`--l7-timeout`, separate from `--timeout`.** The L7 step shared the
+  connect budget, which is tuned for a connect that completes locally — but
+  a TLS handshake has to traverse the App Connector to the backend. Working
+  applications were being reported as L7 timeouts. The default is 4x
+  `--timeout`, clamped to 5-15s; an explicit value is not clamped.
+- **`OPEN_NO_L7_RESPONSE` split into `OPEN_NO_L7_DATA` and
+  `OPEN_NON_HTTP`.** One status covered two unrelated findings: a peer that
+  accepts and then sends nothing (the ZPA signature of a connector with
+  nothing behind it) and a peer that answers in a protocol this probe does
+  not speak (a live service). Existing CSVs keep their old values; new runs
+  use the split.
+- **Fixed: latency included name resolution, and `--timeout` bounded only
+  half the probe.** `socket.create_connection()` resolves inside the region
+  it timed, so DNS latency was reported as connect latency — a run with
+  `--timeout 2` could legitimately report a 5.8s probe. Resolution now
+  happens before the clock starts. The probe still resolves per attempt, so
+  it takes exactly the path `create_connection` would have.
+- **Fixed: `--synthetic-net` before the subcommand failed unhelpfully.**
+  The natural global position produced `argument cmd: invalid choice:
+  '100.64.0.0/16'`, an error that never names the option typed. It is now
+  accepted in either position; on `compare`, `report` and `tenants` — which
+  read the range from the run's saved metadata — it is rejected with an
+  explanation rather than silently ignored.
+
 ## v1.6.0
 The ZCC synthetic IP range is now configurable. Validated 207/207 unit and
 52/52 end-to-end on macOS; unit suite also green on Linux and Windows 11.

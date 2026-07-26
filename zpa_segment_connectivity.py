@@ -81,7 +81,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-SCRIPT_VERSION = "1.6.0"
+SCRIPT_VERSION = "1.7.0"
 DEFAULT_API_BASE = "https://api.zsapi.net"
 OAUTH_AUDIENCE = "https://api.zscaler.com"
 # Zscaler's documented default synthetic range. It is TENANT-CONFIGURABLE:
@@ -118,6 +118,31 @@ def synthetic_net_for(args):
     net = parse_synthetic_net(raw)
     args.synthetic_net_resolved = net
     return net
+
+
+# The L7 step gets its own, larger budget than --timeout. See l7_timeout_for.
+# The ceiling bounds only the *derived* default — an explicit --l7-timeout is
+# honoured above it — so a generous --timeout cannot extrapolate into a
+# per-probe wait long enough to dominate the run.
+L7_TIMEOUT_FACTOR = 4
+L7_TIMEOUT_FLOOR = 5.0
+L7_TIMEOUT_CEILING = 15.0
+
+# An L7 result that proves an application answered. Everything else on an
+# OPEN port — no data, non-HTTP bytes, or an L7 error — means TCP reachability
+# was established without demonstrating that anything is serving.
+L7_VERIFIED_PREFIXES = ("TLS:", "HTTP:")
+
+# What each non-verifying L7 outcome actually implies, for the summary.
+L7_MEANINGS = {
+    "OPEN_NO_L7_DATA": "accepted the connection then sent nothing — "
+                       "typically nothing serving behind the App Connector",
+    "OPEN_NON_HTTP": "sent bytes that are neither TLS nor HTTP — a live "
+                     "service this probe cannot speak to",
+}
+L7_ERROR_MEANING = ("the L7 exchange failed outright — raise --l7-timeout "
+                    "before reading these as application faults")
+
 PAGE_SIZE = 500
 FULL_CIDR_HOST_CAP = 65536   # hard memory guard even in full scope
 CONFIRM_THRESHOLD = 2000     # confirm before runs bigger than this
@@ -1149,17 +1174,42 @@ def resolve(domain, timeout):
 
 
 def tcp_probe(host, port, timeout):
-    """Attempt a TCP connect; returns (status, latency_ms)."""
-    start = time.monotonic()
+    """Attempt a TCP connect; returns (status, latency_ms).
+
+    Resolution happens before the clock starts. socket.create_connection()
+    resolves *inside* the region it times, which had two consequences: DNS
+    latency was reported as connect latency, and --timeout bounded only the
+    connect half of the call, so a run with --timeout 2 could legitimately
+    report a 5.8s probe.
+
+    The connect still targets a freshly resolved address rather than the one
+    cached during the resolve phase. ZPA steering is expressed in what the
+    resolver returns for the FQDN, so resolving here keeps the probe on
+    exactly the path create_connection would have taken.
+    """
     try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return "OPEN", round((time.monotonic() - start) * 1000, 1)
+        infos = socket.getaddrinfo(host, port, socket.AF_INET,
+                                   socket.SOCK_STREAM)
+    except OSError as e:                        # gaierror included
+        return f"ERROR:{e.strerror or e}", None
+    if not infos:
+        return "ERROR:no address returned", None
+
+    af, socktype, proto, _canon, sockaddr = infos[0]
+    sock = socket.socket(af, socktype, proto)
+    try:
+        sock.settimeout(timeout)
+        start = time.monotonic()
+        sock.connect(sockaddr)
+        return "OPEN", round((time.monotonic() - start) * 1000, 1)
     except socket.timeout:
         return "TIMEOUT", None
     except ConnectionRefusedError:
         return "REFUSED", None
     except OSError as e:
         return f"ERROR:{e.strerror or e}", None
+    finally:
+        sock.close()
 
 
 def tcp_probe_retry(host, port, timeout, retries):
@@ -1183,12 +1233,47 @@ def tcp_probe_retry(host, port, timeout, retries):
     return status, latency, attempts
 
 
+def l7_timeout_for(args):
+    """Timeout budget for the L7 step, resolved once and cached on args.
+
+    Deliberately not --timeout. A TCP connect brokered by Client Connector
+    completes locally and fast, so --timeout is tuned low; a TLS handshake
+    over the same path has to traverse the App Connector to the backend and
+    routinely needs several times as long. Sharing one budget reported
+    working applications as L7 timeouts, which reads as an application
+    fault rather than a measurement artefact.
+    """
+    cached = getattr(args, "l7_timeout_resolved", None)
+    if cached is not None:
+        return cached
+    raw = getattr(args, "l7_timeout", None)
+    if raw is not None:
+        if raw <= 0:
+            sys.exit("ERROR: --l7-timeout must be greater than 0.")
+        val = float(raw)
+    else:
+        val = min(L7_TIMEOUT_CEILING,
+                  max(L7_TIMEOUT_FLOOR,
+                      getattr(args, "timeout", 2.0) * L7_TIMEOUT_FACTOR))
+    args.l7_timeout_resolved = val
+    return val
+
+
 def l7_probe(host, port, timeout, sni=None):
     """Verify something is actually serving, not just that TCP answered.
 
     Tries TLS first; falls back to a plaintext HTTP HEAD. Certificates are
     not validated — the goal is proof of an application response, and
     internal PKI/TLS inspection would otherwise produce noise.
+
+    The two non-answering outcomes are reported separately because they mean
+    different things. A peer that accepts and then sends nothing at all
+    (OPEN_NO_L7_DATA) is the signature of a connection terminated locally by
+    Client Connector with nothing serving behind the App Connector. A peer
+    that sends bytes which are neither TLS nor HTTP (OPEN_NON_HTTP) is a
+    live application this probe simply cannot speak to. Collapsing both into
+    one status made a real ZPA finding indistinguishable from a protocol
+    mismatch.
     """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -1204,11 +1289,13 @@ def l7_probe(host, port, timeout, sni=None):
         with socket.create_connection((host, port), timeout=timeout) as sock:
             sock.sendall(b"HEAD / HTTP/1.0\r\nHost: "
                          + (sni or host).encode() + b"\r\n\r\n")
-            data = sock.recv(128).decode("latin-1", "replace")
-        m = re.match(r"HTTP/\d\.\d\s+(\d{3})", data)
+            raw = sock.recv(128)
+        if not raw:
+            return "OPEN_NO_L7_DATA"
+        m = re.match(r"HTTP/\d\.\d\s+(\d{3})", raw.decode("latin-1", "replace"))
         if m:
             return f"HTTP:{m.group(1)}"
-        return "OPEN_NO_L7_RESPONSE"
+        return "OPEN_NON_HTTP"
     except (OSError, ssl.SSLError) as e:
         return f"L7_ERROR:{getattr(e, 'strerror', None) or type(e).__name__}"
 
@@ -1286,7 +1373,8 @@ def probe_port(target, port, res, args):
         target["probe_domain"], port, args.timeout, args.retries)
     l7 = ""
     if args.l7 and status in OK_STATUSES:
-        l7 = l7_probe(target["probe_domain"], port, args.timeout, res["sni"])
+        l7 = l7_probe(target["probe_domain"], port, l7_timeout_for(args),
+                      res["sni"])
     return {**target_base(target), "resolved_ip": res["ip"],
             "zpa_intercepted": res["intercepted"],
             "protocol": "tcp", "port": port,
@@ -1384,7 +1472,7 @@ def coverage_report(stats, args, tcp_probes):
 
 
 def next_steps(args, stats, action, unverifiable, dns_fail, dns_flush_ok,
-               intercepted):
+               intercepted, l7s=None):
     """Recommendations derived from this run's actual results.
 
     dns_flush_ok is the boolean from flush_dns_cache(): True fully flushed,
@@ -1417,6 +1505,21 @@ def next_steps(args, stats, action, unverifiable, dns_fail, dns_flush_ok,
             f"{len(unverifiable)} probe(s) across {len(segs)} segment(s) were "
             "IP/CIDR entries, which cannot prove steering from an endpoint "
             "(caveat 1). Confirm them in the ZPA admin portal's access logs.")
+    if l7s and l7s["unverified"]:
+        err = l7s["breakdown"].get("L7_ERROR", 0)
+        step = (f"{l7s['unverified']} of {l7s['probed']} OPEN probes "
+                f"({100 - l7s['pct_verified']:.1f}%) had no application "
+                "response. TCP reachability through ZPA is established by "
+                "Client Connector locally, so a port reads as OPEN whether "
+                "or not anything behind the App Connector is serving — do "
+                "not read the reachability count as an application pass.")
+        if err:
+            step += (f" {err} of them were L7 errors rather than empty "
+                     "replies; re-run with a larger --l7-timeout to separate "
+                     "a tight budget from a genuinely silent backend.")
+        step += (" Then confirm the App Connector can reach those backends "
+                 "on those ports.")
+        steps.append(step)
     if stats["kinds"]["wildcard"] and not args.wildcard_probe:
         steps.append(
             f"{stats['kinds']['wildcard']} wildcard entries were not probed. "
@@ -1571,6 +1674,59 @@ def latency_stats(rows):
 
     return {"count": len(vals), "median_ms": round(pct(50), 1),
             "p95_ms": round(pct(95), 1), "max_ms": round(vals[-1], 1)}
+
+
+def l7_verified(value):
+    """True when this l7_result proves an application responded."""
+    return str(value).startswith(L7_VERIFIED_PREFIXES)
+
+
+def l7_stats(rows):
+    """Application-response breakdown over probes the L7 step actually ran.
+
+    Returns None when --l7 was off, so callers can stay silent rather than
+    print a section of zeroes.
+
+    This exists because TCP reachability through ZPA is established by
+    Client Connector locally: a port reads as OPEN as soon as ZCC accepts
+    the connection, whether or not anything behind the App Connector is
+    serving. A run could therefore report "249/249 TCP REACHABLE, 0 FAILING
+    PROBES, 0 actionable findings" while more than half of those probes had
+    no application on the other end. The L7 data was already being written
+    to the CSV; it was simply absent from every headline that summarised it.
+    """
+    ran = [r for r in rows
+           if str(r.get("status", "")) in OK_STATUSES and r.get("l7_result")]
+    if not ran:
+        return None
+    verified = [r for r in ran if l7_verified(r.get("l7_result"))]
+    unverified = [r for r in ran if not l7_verified(r.get("l7_result"))]
+
+    breakdown = {}
+    for r in ran:
+        v = str(r.get("l7_result"))
+        key = "L7_ERROR" if v.startswith("L7_ERROR:") else v
+        breakdown[key] = breakdown.get(key, 0) + 1
+
+    by_segment = {}
+    for r in unverified:
+        seg = str(r.get("segment", ""))
+        by_segment[seg] = by_segment.get(seg, 0) + 1
+    probed_by_segment = {}
+    for r in ran:
+        seg = str(r.get("segment", ""))
+        probed_by_segment[seg] = probed_by_segment.get(seg, 0) + 1
+
+    return {
+        "probed": len(ran),
+        "verified": len(verified),
+        "unverified": len(unverified),
+        "pct_verified": round(100.0 * len(verified) / len(ran), 1),
+        "breakdown": breakdown,
+        "unverified_by_segment": sorted(
+            ((s, n, probed_by_segment.get(s, n)) for s, n in
+             by_segment.items()), key=lambda t: (-t[1], t[0])),
+    }
 
 
 def slowest_segments(rows, cap=SLOW_SEGMENT_CAP):
@@ -1770,6 +1926,7 @@ def run_test(args):
     synth = synthetic_net_for(args)
     verdict_label, verdict_detail = run_verdict(args, intercepted, zcc, synth)
     lat = latency_stats(all_rows)
+    l7s = l7_stats(all_rows)
 
     meta = {
         "script_version": SCRIPT_VERSION,
@@ -1789,7 +1946,9 @@ def run_test(args):
                      "cidr_hosts": args.cidr_hosts,
                      "max_ports": args.max_ports,
                      "retries": args.retries, "l7": args.l7,
-                     "timeout_s": args.timeout, "workers": args.workers},
+                     "timeout_s": args.timeout,
+                     "l7_timeout_s": l7_timeout_for(args) if args.l7 else None,
+                     "workers": args.workers},
         "zcc": zcc,
         "synthetic_net": str(synth),
         "dns_cache_flush": dns_flush,
@@ -1804,6 +1963,7 @@ def run_test(args):
                     "worker_errors": worker_errors},
         "status_counts": status_histogram(all_rows),
         "latency": lat,
+        "l7": l7s,
         "slowest_segments": [{"segment": s, "median_ms": m, "probes": n}
                              for s, m, n in slowest_segments(all_rows)],
         "intercepted_domain_list": sorted(intercepted),
@@ -1822,6 +1982,12 @@ def run_test(args):
         (s for s in hist if s not in ("OPEN", "OPEN_FLAKY")),
         key=lambda s: -hist[s])
     print("  RESULTS   " + "  ".join(f"{s} {hist[s]}" for s in order))
+    # Immediately below the reachability count, because that is the number
+    # this qualifies: OPEN means ZCC accepted the connection, not that an
+    # application answered.
+    if l7s:
+        print(f"  L7        {l7s['verified']}/{l7s['probed']} OPEN probes had "
+              f"an application respond ({l7s['pct_verified']}%)")
     if worker_errors:
         print(f"  [!] {worker_errors} target(s) raised a probe error — see "
               "PROBE_ERROR rows in the CSV")
@@ -1829,6 +1995,26 @@ def run_test(args):
     print(_section("COVERAGE"))
     for line in coverage_report(stats, args, len(tcp_rows)):
         print(line)
+
+    if l7s:
+        print(_section("L7 VERIFICATION (application response on OPEN ports)"))
+        print(f"    verified   {l7s['verified']:>5}  "
+              f"({l7s['pct_verified']}% of {l7s['probed']} probes)")
+        print(f"    unverified {l7s['unverified']:>5}  "
+              "TCP opened, no application response")
+        print(f"    l7 timeout {l7_timeout_for(args)}s "
+              f"(--timeout {args.timeout}s; raise --l7-timeout to rule out a "
+              "tight budget)")
+        print("\n    breakdown:")
+        for v, n in sorted(l7s["breakdown"].items(), key=lambda kv: -kv[1]):
+            note = L7_ERROR_MEANING if v == "L7_ERROR" else L7_MEANINGS.get(v)
+            mark = "    " if l7_verified(v) else " [!]"
+            print(f"     {mark} {v:<24} {n:>5}"
+                  + (f"  — {note}" if note else ""))
+        if l7s["unverified_by_segment"]:
+            print("\n    unverified by segment (unverified/probed):")
+            for seg, n, tot in l7s["unverified_by_segment"][:ROLLUP_CAP]:
+                print(f"      {seg[:44]:<44} {n:>5}/{tot}")
 
     if lat:
         print(_section("LATENCY (successful connects)"))
@@ -1873,7 +2059,14 @@ def run_test(args):
     if args.show_failures:
         print(_section(f"FINDINGS ({len(action)} actionable)"))
         if not action:
-            print("    none — every probed entry behaved as expected")
+            # "behaved as expected" was previously printed on the strength of
+            # the TCP result alone, which made a run where most probes had no
+            # application response read as a clean pass.
+            if l7s and l7s["unverified"]:
+                print("    no TCP-level failures, but "
+                      f"{l7s['unverified']} of {l7s['probed']} OPEN probes "
+                      "had no application response — see L7 VERIFICATION")
+    
         else:
             groups = group_failures(action)
             shown_rows = 0
@@ -1910,7 +2103,7 @@ def run_test(args):
                 print(f"      {seg[:34]:<34} {shown}")
 
     steps = next_steps(args, stats, action, unverifiable, dns_fail,
-                       dns_flush_ok, intercepted)
+                       dns_flush_ok, intercepted, l7s)
     if steps:
         print(_section("NEXT STEPS"))
         for i, s in enumerate(steps, 1):
@@ -2149,18 +2342,27 @@ HTML_JS = """
   // containing "open".
   function ok(s){ return s === 'OPEN' || s === 'OPEN_FLAKY'; }
   function tcp(d){ return d.proto === 'tcp' && d.status !== 'NO_TCP_PORTS'; }
+  // Mirrors l7_verified() in the Python: only a TLS handshake or an HTTP
+  // status line proves an application answered.
+  function l7ran(d){ return ok(d.status) && d.l7 !== ''; }
+  function l7ok(d){ return d.l7.indexOf('TLS:') === 0
+                        || d.l7.indexOf('HTTP:') === 0; }
   var PRED = {
     reachable: function(d){ return tcp(d) && ok(d.status); },
     failing:   function(d){ return tcp(d) && !ok(d.status); },
     flaky:     function(d){ return d.proto === 'tcp'
                                    && d.status === 'OPEN_FLAKY'; },
     dnsfail:   function(d){ return d.status.indexOf('DNS_FAIL') === 0; },
-    steered:   function(d){ return d.steered === 'True'; }
+    steered:   function(d){ return d.steered === 'True'; },
+    l7verified:   function(d){ return l7ran(d) && l7ok(d); },
+    l7unverified: function(d){ return l7ran(d) && !l7ok(d); }
   };
   var LABEL = {
     reachable: 'TCP reachable', failing: 'failing probes',
     flaky: 'flaky (retry only)', dnsfail: 'DNS failures',
-    steered: 'ZPA-steered rows'
+    steered: 'ZPA-steered rows',
+    l7verified: 'L7 verified (application responded)',
+    l7unverified: 'OPEN with no application response'
   };
 
   document.querySelectorAll('table[id]').forEach(function(table){
@@ -2178,6 +2380,7 @@ HTML_JS = """
       rows.forEach(function(tr){
         var d = { status:  tr.getAttribute('data-status')  || '',
                   proto:   tr.getAttribute('data-proto')   || '',
+                  l7:      tr.getAttribute('data-l7')      || '',
                   steered: tr.getAttribute('data-steered') || '' };
         var pass = true;
         if (active && active.status !== undefined) {
@@ -2340,6 +2543,18 @@ def write_html_report(out_path, runs, diff=None):
                            "bad" if dns_fail else "ok", filt="dnsfail"))
         parts.append(_tile(len(interc), "ZPA-steered domains", "info",
                            filt="steered"))
+        # Derived from the rows, not from meta, so a CSV written before the
+        # L7 summary existed still reports it.
+        l7_ran = [r for r in tcp
+                  if r.get("status") in OK_STATUSES and r.get("l7_result")]
+        if l7_ran:
+            l7_ok = [r for r in l7_ran if l7_verified(r.get("l7_result"))]
+            l7_bad = len(l7_ran) - len(l7_ok)
+            parts.append(_tile(f"{len(l7_ok)}/{len(l7_ran)}", "L7 verified",
+                               "ok" if not l7_bad else "warn",
+                               filt="l7verified"))
+            parts.append(_tile(l7_bad, "no app response",
+                               "bad" if l7_bad else "ok", filt="l7unverified"))
         lat_m = (meta.get("latency") or {}).get("median_ms")
         if lat_m is not None:
             # a median is not a row set — deliberately not a filter
@@ -2365,6 +2580,7 @@ def write_html_report(out_path, runs, diff=None):
             parts.append(
                 f'<tr data-status="{html.escape(st)}" '
                 f'data-proto="{html.escape(str(r.get("protocol", "")))}" '
+                f'data-l7="{html.escape(str(r.get("l7_result", "")))}" '
                 f'data-steered="{html.escape(str(r.get("zpa_intercepted", "")))}">')
             for c in cols:
                 v = r.get(c, "")
@@ -2699,17 +2915,40 @@ def run_verify_sipa(args):
 # CLI
 # --------------------------------------------------------------------------
 
+# Subcommands that read the synthetic range from a run's saved metadata
+# rather than taking it as input. Accepting the flag here and ignoring it
+# would silently produce a report keyed to the wrong range.
+SYNTHETIC_NET_NOT_APPLICABLE = ("compare", "report", "tenants")
+
+
+def add_synthetic_net_arg(p, suppress_default=False):
+    """--synthetic-net, accepted both before and after the subcommand.
+
+    It was previously only defined on the subparsers, so the natural global
+    position produced 'argument cmd: invalid choice: 100.64.0.0/16' — an
+    error that never names the option the user actually typed. Defining it
+    on both parsers fixes that; the subparser copy uses SUPPRESS so that
+    omitting it after the subcommand does not overwrite a value given
+    before it.
+    """
+    kwargs = {"metavar": "CIDR",
+              "help": "ZCC synthetic IP range for this tenant (default "
+                      f"{DEFAULT_SYNTHETIC_NET}). Tenant-configurable and "
+                      "commonly narrowed, e.g. 100.64.0.0/16. Too wide a "
+                      "range reports CGNAT addresses as ZPA-steered. May be "
+                      "given before or after the subcommand, or stored per "
+                      "tenant"}
+    if suppress_default:
+        kwargs["default"] = argparse.SUPPRESS
+    p.add_argument("--synthetic-net", **kwargs)
+
+
 def add_api_args(p):
     p.add_argument("--tenant", metavar="NAME",
                    help="use a saved tenant (see the 'tenants' subcommand). "
                         "Without it, saved tenants are offered interactively; "
                         "selection is confirmed twice")
-    p.add_argument("--synthetic-net", metavar="CIDR",
-                   help="ZCC synthetic IP range for this tenant (default "
-                        f"{DEFAULT_SYNTHETIC_NET}). This is tenant-"
-                        "configurable and commonly narrowed, e.g. "
-                        "100.64.0.0/16. Too wide a range reports CGNAT "
-                        "addresses as ZPA-steered")
+    add_synthetic_net_arg(p, suppress_default=True)
     p.add_argument("--client-id", help="OneAPI client ID "
                    "(or env ZSCALER_CLIENT_ID)")
     p.add_argument("--vanity-domain", help="Zidentity vanity domain "
@@ -2743,6 +2982,7 @@ def main():
         description="ZPA application segment connectivity tester",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Run '<subcommand> --help' for per-command options.")
+    add_synthetic_net_arg(ap)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     # -- preflight ---------------------------------------------------------
@@ -2816,6 +3056,15 @@ def main():
     t.add_argument("--l7", action="store_true",
                    help="on OPEN ports, verify an app actually responds "
                         "(TLS handshake or HTTP status), not just TCP")
+    t.add_argument("--l7-timeout", type=float, metavar="SECONDS",
+                   help=f"timeout for the L7 step (default: {L7_TIMEOUT_FACTOR}x "
+                        f"--timeout, clamped to {L7_TIMEOUT_FLOOR}-"
+                        f"{L7_TIMEOUT_CEILING}s; an explicit value is not "
+                        "clamped). A TCP "
+                        "connect through ZPA completes locally at Client "
+                        "Connector, but a TLS handshake has to reach the "
+                        "backend via the App Connector — sharing --timeout "
+                        "reports working apps as L7 timeouts")
     t.add_argument("--sipa-only", action="store_true",
                    help="only test Source IP Anchoring segments "
                         "(ipAnchored=true) — typical for --phase pre")
@@ -2914,6 +3163,15 @@ def main():
     r.set_defaults(func=run_report)
 
     args = ap.parse_args()
+    # Reject rather than ignore: these subcommands take the range from the
+    # metadata written alongside the CSV, so honouring the flag here would
+    # mean re-labelling a finished run with a range it was not measured on.
+    if (getattr(args, "synthetic_net", None)
+            and args.cmd in SYNTHETIC_NET_NOT_APPLICABLE):
+        sys.exit(f"ERROR: --synthetic-net does not apply to '{args.cmd}'. The "
+                 "range is recorded per run in its .meta.json and read from "
+                 "there. Set it on 'test'/'preflight'/'export-targets', or "
+                 "store it per tenant with 'tenants add'.")
     args.func(args)
 
 

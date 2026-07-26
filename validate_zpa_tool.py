@@ -16,9 +16,12 @@ import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 
 PASS, FAIL = [], []
 
@@ -56,7 +59,8 @@ class Args:
             output_dir="out", show_failures=False, yes=True, insecure=False,
             ca_bundle=None, client_id=None, vanity_domain=None,
             customer_id=None, api_base="https://api.zsapi.net",
-            targets_file=None, retries=0, l7=False, flush_dns=False,
+            targets_file=None, retries=0, l7=False, l7_timeout=None,
+            flush_dns=False,
             report=False, microtenant_id=None)
         defaults.update(kw)
         for k, v in defaults.items():
@@ -211,6 +215,186 @@ def main():
         [{"id": "9", "domainNames": ["a.corp"]}], Args(segment="nomatch"))
     check("--segment filter tolerates missing name",
           st8["segments_matched"] == 0)
+
+    # ------------------------------------------------------- L7 verification
+    # A run can report "249/249 TCP REACHABLE, 0 FAILING PROBES" while most
+    # of those probes had no application on the other end: through ZPA the
+    # connection is accepted locally by Client Connector. These assert the
+    # L7 result is measured with its own budget, classified honestly, and
+    # actually reaches the summary.
+    print("\nL7 verification")
+    check("verified prefixes are TLS/HTTP only",
+          m.l7_verified("TLS:TLSv1.3") and m.l7_verified("HTTP:301")
+          and not m.l7_verified("OPEN_NO_L7_DATA")
+          and not m.l7_verified("OPEN_NON_HTTP")
+          and not m.l7_verified("L7_ERROR:TimeoutError")
+          and not m.l7_verified(""))
+    check("the two silent outcomes are separate statuses",
+          "OPEN_NO_L7_DATA" in m.L7_MEANINGS
+          and "OPEN_NON_HTTP" in m.L7_MEANINGS)
+
+    _a = Args(timeout=2.0, l7_timeout=None)
+    check("l7 budget defaults to a multiple of --timeout",
+          m.l7_timeout_for(_a) == min(m.L7_TIMEOUT_CEILING,
+                                      max(m.L7_TIMEOUT_FLOOR,
+                                          2.0 * m.L7_TIMEOUT_FACTOR)),
+          str(m.l7_timeout_for(_a)))
+    check("derived l7 budget is capped",
+          m.l7_timeout_for(Args(timeout=60.0, l7_timeout=None))
+          == m.L7_TIMEOUT_CEILING)
+    check("an explicit l7 budget is not capped",
+          m.l7_timeout_for(Args(timeout=2.0, l7_timeout=45.0)) == 45.0)
+    check("l7 budget exceeds the connect budget",
+          m.l7_timeout_for(Args(timeout=2.0, l7_timeout=None)) > 2.0)
+    check("l7 budget has a floor",
+          m.l7_timeout_for(Args(timeout=0.2, l7_timeout=None))
+          == m.L7_TIMEOUT_FLOOR)
+    check("explicit --l7-timeout wins",
+          m.l7_timeout_for(Args(timeout=2.0, l7_timeout=30.0)) == 30.0)
+    _a = Args(timeout=2.0, l7_timeout=None)
+    m.l7_timeout_for(_a)
+    _a.timeout = 99.0
+    check("l7 budget is resolved once and cached", m.l7_timeout_for(_a) == 8.0)
+    try:
+        m.l7_timeout_for(Args(timeout=2.0, l7_timeout=0))
+        check("non-positive --l7-timeout rejected", False, "no exit")
+    except SystemExit as e:
+        check("non-positive --l7-timeout rejected",
+              "greater than 0" in str(e), str(e))
+
+    def _l7row(seg, l7, status="OPEN"):
+        return {"segment": seg, "status": status, "l7_result": l7,
+                "protocol": "tcp", "port": 443, "entry_kind": "fqdn",
+                "domain": "d.corp.local", "probe_domain": "d.corp.local",
+                "resolved_ip": "100.64.1.1", "zpa_intercepted": True,
+                "enabled": True, "ip_anchored": True, "attempts": 1,
+                "latency_ms": 150.0}
+
+    _rows7 = ([_l7row("A", "TLS:TLSv1.3")] * 47
+              + [_l7row("A", "HTTP:301")] * 45
+              + [_l7row("B", "TLS:TLSv1.2")] * 15
+              + [_l7row("A", "OPEN_NO_L7_DATA")] * 112
+              + [_l7row("B", "L7_ERROR:TimeoutError")] * 30)
+    _s7 = m.l7_stats(_rows7)
+    check("l7_stats counts probes that ran", _s7["probed"] == 249)
+    check("l7_stats counts verified", _s7["verified"] == 107)
+    check("l7_stats counts unverified", _s7["unverified"] == 142)
+    check("l7_stats percentage", _s7["pct_verified"] == 43.0)
+    check("l7_stats breakdown sums to probed",
+          sum(_s7["breakdown"].values()) == 249)
+    check("l7_stats collapses L7_ERROR detail",
+          _s7["breakdown"].get("L7_ERROR") == 30, str(_s7["breakdown"]))
+    check("l7_stats attributes unverified per segment",
+          dict((k, v) for k, v, _ in _s7["unverified_by_segment"])
+          == {"A": 112, "B": 30}, str(_s7["unverified_by_segment"]))
+    check("l7_stats is None when --l7 was off",
+          m.l7_stats([_l7row("A", "")]) is None)
+    check("failed probes are outside the L7 denominator",
+          m.l7_stats(_rows7 + [_l7row("A", "", "TIMEOUT")])["probed"] == 249)
+
+    _st = {"kinds": {"fqdn": 3, "ip": 0, "cidr": 0, "wildcard": 0},
+           "entries_sampled_out": 0, "ports_truncated": 0}
+    _steps = " ".join(m.next_steps(Args(phase="post", l7=True), _st, [], [],
+                                   [], None, {"a"}, _s7))
+    check("NEXT STEPS reports the unverified ratio", "142 of 249" in _steps,
+          _steps[:200])
+    check("NEXT STEPS explains OPEN is established locally",
+          "Client Connector locally" in _steps)
+    check("NEXT STEPS points at --l7-timeout for L7 errors",
+          "--l7-timeout" in _steps and "30 of them" in _steps, _steps[:300])
+    check("no L7 step when everything verified",
+          "application response" not in " ".join(m.next_steps(
+              Args(phase="post", l7=True), _st, [], [], [], None, {"a"},
+              m.l7_stats([_l7row("A", "TLS:TLSv1.3")]))))
+    check("no L7 step when --l7 was off",
+          "application response" not in " ".join(m.next_steps(
+              Args(phase="post"), _st, [], [], [], None, {"a"}, None)))
+
+    # The L7 result was already in the CSV before this; what was missing was
+    # any path from it to a headline. Assert it reaches the report.
+    _hdir = tempfile.mkdtemp(prefix="zpa-validate-l7-")
+    try:
+        _hp = os.path.join(_hdir, "l7.html")
+        m.write_html_report(_hp, [("post_sample_h.csv", _rows7,
+                                   {"phase": "post", "hostname": "h",
+                                    "zcc": {"state": "running",
+                                            "processes_found": []}})])
+        _hh = open(_hp, encoding="utf-8").read()
+        check("report renders an L7 verified tile",
+              ">107/249<" in _hh and 'data-tilefilter="l7verified"' in _hh)
+        check("report renders a no-app-response tile",
+              'data-tilefilter="l7unverified"' in _hh
+              and '<div class="n bad">142</div>' in _hh)
+        check("report rows carry data-l7",
+              'data-l7="OPEN_NO_L7_DATA"' in _hh
+              and 'data-l7="TLS:TLSv1.3"' in _hh)
+        check("report JS reads data-l7",
+              "tr.getAttribute('data-l7')" in _hh
+              and "l7unverified: function" in _hh)
+    finally:
+        shutil.rmtree(_hdir, ignore_errors=True)
+
+    # -------------------------------------------------- latency measurement
+    # socket.create_connection() resolves inside the region it times, so DNS
+    # latency was reported as connect latency and --timeout bounded only the
+    # connect half of the call.
+    print("\nLatency measurement")
+    _srv = socket.socket()
+    _srv.bind(("127.0.0.1", 0))
+    _srv.listen(64)
+    _lport = _srv.getsockname()[1]
+
+    def _drain():
+        while True:
+            try:
+                _c, _ = _srv.accept()
+            except OSError:
+                return
+            _c.close()
+
+    threading.Thread(target=_drain, daemon=True).start()
+    _real_gai = socket.getaddrinfo
+
+    def _slow_gai(host, port, *a, **k):
+        if host == "slow.validate.test":
+            time.sleep(1.0)
+            return _real_gai("127.0.0.1", port, *a, **k)
+        return _real_gai(host, port, *a, **k)
+
+    socket.getaddrinfo = _slow_gai
+    try:
+        _t0 = time.monotonic()
+        _stat, _lat = m.tcp_probe("slow.validate.test", _lport, 2.0)
+        _wall = (time.monotonic() - _t0) * 1000
+    finally:
+        socket.getaddrinfo = _real_gai
+    check("connect through a slow resolver still OPEN", _stat == "OPEN", _stat)
+    check("the slow resolve really ran", _wall > 900, f"{_wall:.0f}ms")
+    check("reported latency excludes resolution",
+          _lat is not None and _lat < 200,
+          f"latency={_lat}ms wall={_wall:.0f}ms")
+    check("plain connect still OPEN",
+          m.tcp_probe("127.0.0.1", _lport, 2.0)[0] == "OPEN")
+    _cl = socket.socket()
+    _cl.bind(("127.0.0.1", 0))
+    _cport = _cl.getsockname()[1]
+    _cl.close()
+    check("refusal still REFUSED",
+          m.tcp_probe("127.0.0.1", _cport, 1.0)[0] == "REFUSED")
+    check("resolution failure reported as ERROR:",
+          m.tcp_probe("no-such-host.invalid", 443, 1.0)[0].startswith("ERROR:"))
+    check("failures carry no latency",
+          m.tcp_probe("127.0.0.1", _cport, 1.0)[1] is None)
+    if os.path.isdir("/proc/self/fd"):
+        time.sleep(0.2)
+        _b = len(os.listdir("/proc/self/fd"))
+        for _ in range(40):
+            m.tcp_probe("127.0.0.1", _lport, 1.0)
+        time.sleep(0.2)
+        check("no descriptor leak across 40 probes",
+              len(os.listdir("/proc/self/fd")) - _b <= 2,
+              f"{_b} -> {len(os.listdir('/proc/self/fd'))}")
+    _srv.close()
 
     # ------------------------------------------------------------ probe layer
     print("\nSIPA anchoring verification")
@@ -878,24 +1062,45 @@ def main():
         # clicking it shows a different number, silently. Mirror the JS here
         # and assert each tile selects exactly what it claims.
         _h = open(csv_path.replace(".csv", ".html"), encoding="utf-8").read()
-        _rows = [{"status": g[0], "proto": g[1], "steered": g[2]}
-                 for g in re.findall(
-                     r'<tr data-status="([^"]*)" data-proto="([^"]*)" '
-                     r'data-steered="([^"]*)"', _h)]
+        # Attributes are parsed generically rather than matched in a fixed
+        # order: pinning the order meant adding one data-* attribute to the
+        # renderer silently reduced this to zero rows, and every predicate
+        # check below then compared 0 against 0 and passed.
+        _rows = [dict(re.findall(r'data-([a-z0-9]+)="([^"]*)"', _tag))
+                 for _tag in re.findall(r"<tr ([^>]*)>", _h)]
         _tiles = dict(re.findall(
-            r'<div class="tile" data-tilefilter="([a-z]+)"[^>]*>'
+            r'<div class="tile" data-tilefilter="([a-z0-9]+)"[^>]*>'
             r'<div class="n [^"]*">([^<]*)</div>', _h))
         check("every row carries machine-readable state",
               len(_rows) == len(rows), f"{len(_rows)} of {len(rows)}")
-        check("all five filterable tiles are present",
-              set(_tiles) == {"reachable", "failing", "flaky", "dnsfail",
-                              "steered"}, str(sorted(_tiles)))
+        check("every row exposes status/proto/steered/l7",
+              all({"status", "proto", "steered", "l7"} <= set(d)
+                  for d in _rows),
+              str(sorted(_rows[0])) if _rows else "no rows")
+        # The L7 pair renders only when the L7 step produced results, so
+        # which set is expected depends on this run. Asserting the pair
+        # unconditionally would fail on any run whose probes never opened.
+        _l7_seen = any(d.get("l7") for d in _rows)
+        _want_tiles = {"reachable", "failing", "flaky", "dnsfail", "steered"}
+        if _l7_seen:
+            _want_tiles |= {"l7verified", "l7unverified"}
+        check("exactly the applicable filterable tiles are present",
+              set(_tiles) == _want_tiles,
+              f"got {sorted(_tiles)} want {sorted(_want_tiles)}")
+        check("L7 tiles are omitted when the L7 step produced nothing",
+              _l7_seen or not ({"l7verified", "l7unverified"} & set(_tiles)))
 
         def _ok(s):
             return s in ("OPEN", "OPEN_FLAKY")
 
         def _tcp(d):
             return d["proto"] == "tcp" and d["status"] != "NO_TCP_PORTS"
+
+        def _l7ran(d):
+            return _ok(d["status"]) and d.get("l7", "") != ""
+
+        def _l7ok(d):
+            return d.get("l7", "").startswith(("TLS:", "HTTP:"))
 
         _pred = {
             "reachable": lambda d: _tcp(d) and _ok(d["status"]),
@@ -904,6 +1109,8 @@ def main():
             and d["status"] == "OPEN_FLAKY",
             "dnsfail": lambda d: d["status"].startswith("DNS_FAIL"),
             "steered": lambda d: d["steered"] == "True",
+            "l7verified": lambda d: _l7ran(d) and _l7ok(d),
+            "l7unverified": lambda d: _l7ran(d) and not _l7ok(d),
         }
         for _k in sorted(_pred):
             _sel = sum(1 for d in _rows if _pred[_k](d))
