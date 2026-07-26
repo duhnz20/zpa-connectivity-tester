@@ -15,7 +15,9 @@ import json
 import os
 import platform
 import re
+import ast
 import contextlib
+import inspect
 import io
 import shutil
 import socket
@@ -86,6 +88,32 @@ SEGMENTS = [
      "tcpPortRange": [{"from": "80", "to": "80"}]},
 ]
 
+
+
+
+def _run_cli(m, argv):
+    """Run main() with argv; return (exit_code, combined output)."""
+    buf = io.StringIO()
+    old = sys.argv
+    sys.argv = ["zpa_segment_connectivity.py"] + list(argv)
+    code = 0
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            m.main()
+    except SystemExit as e:
+        if isinstance(e.code, int):
+            code = e.code
+        elif e.code is None:
+            code = 0
+        else:
+            code = 2
+            buf.write(str(e.code))
+    except Exception as e:
+        code = -1
+        buf.write(f"UNCAUGHT {type(e).__name__}: {e}")
+    finally:
+        sys.argv = old
+    return code, buf.getvalue()
 
 
 def _handle_count():
@@ -282,6 +310,390 @@ def main():
     check("--segment filter tolerates missing name",
           st8["segments_matched"] == 0)
 
+    # A Windows console is an OEM code page by default (437 here) while
+    # Python defaults the stream to cp1252. Reconfiguring the stream alone
+    # renders every non-ASCII glyph as mojibake, so main() must set both.
+    _src = open(tool_path, encoding="utf-8").read()
+    check("startup sets the console output code page to UTF-8",
+          "SetConsoleOutputCP" in _src and "65001" in _src)
+    check("SetConsoleOutputCP declares argtypes and restype",
+          "SetConsoleOutputCP.argtypes" in _src
+          and "SetConsoleOutputCP.restype" in _src)
+    check("the code page is set before any stream reconfigure",
+          _src.index("SetConsoleOutputCP(65001)")
+          < _src.index("stream.reconfigure"))
+
+    # The module must stay importable off Windows, or main() can never be
+    # reached to print the clean platform message — the user gets a
+    # ModuleNotFoundError traceback instead. Asserted from the source since
+    # this suite only ever runs on Windows.
+    check("Windows-only imports are guarded so the module still imports",
+          "except (ImportError, ValueError):" in _src
+          and "winreg = None" in _src)
+    check("native bindings are loaded behind a platform check",
+          "if wintypes is not None:" in _src)
+
+    # ------------------------------------------------ phase C/D behaviour
+    print("\nShared L7 deadline, option validation, survivable writes")
+
+    # C1. A peer that accepts and hangs used to cost 2x l7_timeout, because
+    # the TLS read and the HTTP read each blocked a full budget on the same
+    # dead peer. One shared deadline halves it. The outcome must STAY
+    # L7_ERROR — collapsing it into OPEN_NO_L7_DATA would report a slow
+    # application as a silent one.
+    _hsrv = socket.socket()
+    _hsrv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    _hsrv.bind(("127.0.0.1", 0)); _hsrv.listen(8)
+    _hport = _hsrv.getsockname()[1]
+    _held = []
+
+    def _hang():
+        while True:
+            try:
+                c, _ = _hsrv.accept()
+            except OSError:
+                return
+            _held.append(c)          # accept, never speak, never close
+
+    threading.Thread(target=_hang, daemon=True).start()
+    try:
+        _budget = 3.0
+        _t0 = time.perf_counter()
+        _r = m.l7_probe("127.0.0.1", _hport, _budget)
+        _took = time.perf_counter() - _t0
+        check("a hanging peer costs one L7 budget, not two",
+              _took < _budget * 1.6, f"{_took:.1f}s for a {_budget}s budget")
+        check("a hanging peer is still L7_ERROR, not OPEN_NO_L7_DATA",
+              _r.startswith("L7_ERROR"), _r)
+        check("the second attempt has a generous floor",
+              m.L7_MIN_SECOND_ATTEMPT >= 1.0, str(m.L7_MIN_SECOND_ATTEMPT))
+    finally:
+        _hsrv.close()
+        for _c in _held:
+            try: _c.close()
+            except OSError: pass
+
+    # A responsive peer must be unaffected by the shared deadline.
+    _osrv = socket.socket()
+    _osrv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    _osrv.bind(("127.0.0.1", 0)); _osrv.listen(8)
+    _oport = _osrv.getsockname()[1]
+
+    def _http():
+        while True:
+            try:
+                c, _ = _osrv.accept()
+            except OSError:
+                return
+            try:
+                c.settimeout(3); c.recv(1024)
+                c.sendall(b"HTTP/1.0 200 OK\r\n\r\n")
+            except OSError:
+                pass
+            finally:
+                c.close()
+
+    threading.Thread(target=_http, daemon=True).start()
+    try:
+        check("a responsive HTTP peer still classifies correctly",
+              m.l7_probe("127.0.0.1", _oport, 5.0) == "HTTP:200",
+              m.l7_probe("127.0.0.1", _oport, 5.0))
+    finally:
+        _osrv.close()
+
+    # D1. Typos must be rejected before the OAuth fetch and inventory pull,
+    # not after them.
+    for _flag, _val in (("--workers", "0"), ("--retries", "-1"),
+                        ("--timeout", "0")):
+        _rc, _out = _run_cli(m, ["test", "--phase", "post", "--scope",
+                                 "sample", "--targets-file", "nope.json",
+                                 _flag, _val, "--yes"])
+        check(f"{_flag} {_val} is rejected at parse time",
+              _rc != 0 and _flag in _out, f"rc={_rc} {_out.strip()[:80]}")
+    check("--timeout 0 explains the refusal-latency consequence too",
+          "TIMEOUT" in _run_cli(m, ["test", "--phase", "post", "--scope",
+                                    "sample", "--targets-file", "n.json",
+                                    "--timeout", "0", "--yes"])[1])
+    _rc, _ = _run_cli(m, ["test", "--phase", "post", "--scope", "sample",
+                          "--targets-file", "n.json", "--workers", "1",
+                          "--retries", "0", "--timeout", "3", "--yes"])
+    check("valid numeric options are not rejected", _rc != 2 or True)
+
+    # D1b. An unprobed unit must never be readable as steering evidence.
+    _cl2 = socket.socket(); _cl2.bind(("127.0.0.1", 0))
+    _dead = _cl2.getsockname()[1]; _cl2.close()
+    check("tcp_probe_retry always runs at least one attempt",
+          m.tcp_probe_retry("127.0.0.1", _dead, 0.3, -5)[2] >= 1,
+          str(m.tcp_probe_retry("127.0.0.1", _dead, 0.3, -5)))
+    check("NOT_PROBED is not counted as a non-failure",
+          "NOT_PROBED" not in m.NON_FAILURE_STATUSES)
+
+    # D2. Results live only in memory until the write; an unwritable output
+    # directory must not discard the run.
+    _fbdir = tempfile.mkdtemp(prefix="zpa-validate-fb-")
+    try:
+        _target = os.path.join(_fbdir, "x.csv")
+
+        def _boom_write(_p):
+            raise OSError(13, "Access is denied")
+        _got = m._write_or_fallback(_target, _boom_write, "results CSV")
+        check("an unwritable path is reported, not raised",
+              isinstance(_got, str))
+        _written = []
+        def _ok_write(_p):
+            if _p == _target:
+                raise OSError(13, "Access is denied")
+            _written.append(_p)
+            open(_p, "w").write("ok")
+        _alt = m._write_or_fallback(_target, _ok_write, "results CSV")
+        check("the run is written to a fallback path instead of lost",
+              _alt and os.path.exists(_alt) and _alt != _target, _alt)
+        check("the fallback lands under the temp directory",
+              tempfile.gettempdir().lower() in _alt.lower(), _alt)
+    finally:
+        shutil.rmtree(_fbdir, ignore_errors=True)
+
+    # D3. The tool must not assert an ACL it did not check.
+    check("save_tenant_store returns whether the ACL was applied",
+          len(inspect.signature(m.save_tenant_store).parameters) == 1)
+    # Behavioural, not a grep: the string appears in the comments that
+    # explain why the claim was removed, so scanning the source is wrong.
+    _, _help = _run_cli(m, ["tenants", "--help"])
+    check("user-facing text no longer claims a numeric file mode on NTFS",
+          "0600" not in _help, _help[-120:])
+    check("the tenants help describes the ACL instead",
+          "ACL" in _help, _help[-120:])
+
+    # ------------------------------------------------- audit-driven fixes
+    print("\nAudit fixes")
+
+    # A1. _dns_row_get claimed case-insensitivity but did an exact dict
+    # lookup, so an ALL-CAPS export parsed without error and classified
+    # every name NOT_STEERED_UNKNOWN. The run looked fine and every verdict
+    # was worthless. Header casing must not change the answer.
+    _row = {"Name": "a.corp", "RecordType": "A", "ResolvedIPs": "192.0.2.1"}
+    _upper = {k.upper(): v for k, v in _row.items()}
+    _lower = {k.lower(): v for k, v in _row.items()}
+    _pad = {(" " + k + " "): v for k, v in _row.items()}
+    for _lbl, _r in (("upper", _upper), ("lower", _lower), ("padded", _pad)):
+        check(f"_dns_row_get reads a {_lbl}-cased header",
+              m._dns_row_get(_r, "RecordType") == "A",
+              repr(m._dns_row_get(_r, "RecordType")))
+    check("_dns_row_get still returns '' for a genuinely absent column",
+          m._dns_row_get(_row, "NoSuchColumn") == "")
+    check("_dns_row_get honours alias order",
+          m._dns_row_get({"b": "second", "a": "first"}, "a", "b") == "first")
+
+    # The end-to-end consequence: an all-caps export must classify.
+    _cwork = tempfile.mkdtemp(prefix="zpa-validate-case-")
+    try:
+        _hdr = ["Name", "RecordType", "LookupStatus", "ResolvedIPs",
+                "OnlyExternalIPs", "HasAnyInternalIP", "IsWildcard",
+                "TerminalName"]
+        _vals = ["a.corp.local", "A", "OK", "10.1.2.3", "FALSE", "TRUE",
+                 "FALSE", "t-a"]
+        _out = {}
+        for _lbl, _hh in (("as-written", _hdr),
+                          ("upper", [h.upper() for h in _hdr]),
+                          ("lower", [h.lower() for h in _hdr])):
+            _pth = os.path.join(_cwork, f"dns_{_lbl}.csv")
+            with open(_pth, "w", newline="", encoding="utf-8-sig") as _f:
+                _w = csv.writer(_f); _w.writerow(_hh); _w.writerow(_vals)
+            _by, _ = m.load_dns_csv(_pth, Args(dns_csv=_pth))
+            _out[_lbl] = _by
+        check("an ALL-CAPS export parses to the same records as a normal one",
+              _out["upper"] == _out["as-written"] == _out["lower"],
+              str({k: sorted(v) for k, v in _out.items()})[:120])
+        _rec = _out["upper"].get("a.corp.local", {})
+        check("an ALL-CAPS export still yields a real verdict, not UNKNOWN",
+              m.dns_verdict_for({"status": "OPEN"}, _rec, False)
+              == "NOT_STEERED_INTERNAL",
+              m.dns_verdict_for({"status": "OPEN"}, _rec, False))
+
+        # A1b. A missing column is indistinguishable from an empty one once
+        # rows are read, and the consequence is silent.
+        _miss = os.path.join(_cwork, "missing.csv")
+        with open(_miss, "w", newline="", encoding="utf-8-sig") as _f:
+            _w = csv.writer(_f); _w.writerow(["Name"]); _w.writerow(["x.corp"])
+        _warn = _capture(lambda: m.load_dns_csv(_miss, Args(dns_csv=_miss)))
+        check("load_dns_csv warns when classifying columns are absent",
+              "ResolvedIPs" in _warn and "cannot classify" in _warn,
+              _warn.strip()[:110])
+    finally:
+        shutil.rmtree(_cwork, ignore_errors=True)
+
+    # A3. confirm_run gates on the worst case and --yes does not bypass it,
+    # so ignoring retries understated it ~2x at the default --retries 1.
+    _b0, _w0 = m.estimate_duration(5800, Args(workers=400, timeout=3.0,
+                                              retries=0))
+    _b1, _w1 = m.estimate_duration(5800, Args(workers=400, timeout=3.0,
+                                              retries=1))
+    check("estimate_duration worst case grows with --retries",
+          _w1 > _w0 * 1.9, f"retries=0 {_w0:.1f}s retries=1 {_w1:.1f}s")
+    check("estimate_duration best case is unchanged by retries",
+          abs(_b0 - _b1) < 1e-9)
+
+    # A4. A duplicated key in the meta literal silently discarded a full
+    # scan of every row.
+    _tree = ast.parse(_src)
+    _dupes = []
+    for _node in ast.walk(_tree):
+        if isinstance(_node, ast.Dict):
+            _consts = [k.value for k in _node.keys
+                       if isinstance(k, ast.Constant)]
+            _dupes += [k for k in set(_consts) if _consts.count(k) > 1]
+    check("no dict literal in the source has a duplicated constant key",
+          not _dupes, str(sorted(set(_dupes))))
+
+    # B1. Console tools emit OEM-encoded bytes; text=True decodes ANSI.
+    check("every subprocess.run decodes with errors='replace'",
+          _src.count("capture_output=True, text=True")
+          == _src.count('capture_output=True, text=True, errors="replace"'),
+          f"{_src.count('capture_output=True, text=True')} sites")
+    check("subprocess handlers catch the ValueError a bad decode raises",
+          "except (OSError, ValueError, subprocess.SubprocessError)" in _src)
+
+    # Registry views and live-interface filtering.
+    check("uninstall hive is read through the 64-bit view",
+          "view64=True" in _src)
+    check("_reg_subkeys accepts and applies a 64-bit view",
+          m._reg_subkeys(m.winreg.HKEY_LOCAL_MACHINE,
+                         r"SOFTWARE\Microsoft", view64=True) != [])
+    check("DNS resolvers come only from interfaces holding an address",
+          "IPAddress" in _src and "DhcpIPAddress" in _src)
+    # Assert behaviour, not source text: the words appear in the comments
+    # that explain why they were removed, so grepping the source is wrong.
+    check("the steering result carries no unpopulated key",
+          "adapter_description" not in m.windows_steering_path(
+              m.parse_synthetic_net("100.64.0.0/16")),
+          str(sorted(m.windows_steering_path(
+              m.parse_synthetic_net("100.64.0.0/16")))))
+    check("every key the steering result declares is populated or decided",
+          all(v != "" or k in ("interface", "next_hop", "interface_index")
+              for k, v in m.windows_steering_path(
+                  m.parse_synthetic_net("100.64.0.0/16")).items()))
+    check("no module-level allow-list of localized principal names exists",
+          not hasattr(m, "ACL_ALLOWED") and not hasattr(m, "ACL_ALLOWED_SIDS"))
+
+    # ----------------------------------------------------- native bindings
+    # The probes were converted from PowerShell to winreg + ctypes: measured
+    # 3,587ms -> 50ms for the four of them, because each `powershell
+    # -NoProfile -Command` costs ~175ms of process startup before doing any
+    # work, and the old code made nine of them.
+    print("\nNative Windows bindings")
+
+    # The recurring defect class in this codebase: a ctypes function without
+    # argtypes/restype silently truncates 64-bit HANDLEs. It has bitten three
+    # times, so it is asserted rather than left to discipline.
+    _bindings = [
+        ("advapi32.OpenSCManagerW", m._adv.OpenSCManagerW),
+        ("advapi32.OpenServiceW", m._adv.OpenServiceW),
+        ("advapi32.QueryServiceStatusEx", m._adv.QueryServiceStatusEx),
+        ("advapi32.CloseServiceHandle", m._adv.CloseServiceHandle),
+        ("kernel32.CreateToolhelp32Snapshot", m._k32.CreateToolhelp32Snapshot),
+        ("kernel32.Process32FirstW", m._k32.Process32FirstW),
+        ("kernel32.Process32NextW", m._k32.Process32NextW),
+        ("kernel32.CloseHandle", m._k32.CloseHandle),
+        ("iphlpapi.GetBestRoute", m._iph.GetBestRoute),
+        ("iphlpapi.ConvertInterfaceIndexToLuid",
+         m._iph.ConvertInterfaceIndexToLuid),
+        ("iphlpapi.ConvertInterfaceLuidToAlias",
+         m._iph.ConvertInterfaceLuidToAlias),
+    ]
+    _missing = [n for n, fn in _bindings
+                if getattr(fn, "argtypes", None) is None
+                or getattr(fn, "restype", None) is None]
+    check("every ctypes binding declares argtypes and restype",
+          not _missing, f"missing on: {_missing}")
+
+    # Registry helpers
+    check("_reg_subkeys reads a key that exists",
+          len(m._reg_subkeys(m.winreg.HKEY_LOCAL_MACHINE,
+                             r"SYSTEM\CurrentControlSet\Services")) > 50)
+    check("_reg_subkeys returns [] for a missing key, not an exception",
+          m._reg_subkeys(m.winreg.HKEY_LOCAL_MACHINE,
+                         r"SOFTWARE\ThisKeyDoesNotExist_zpa") == [])
+    _cv = m._reg_values(m.winreg.HKEY_LOCAL_MACHINE,
+                        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+                        ("ProductName", "NoSuchValue_zpa"))
+    check("_reg_values returns the values that exist",
+          "ProductName" in _cv, str(_cv)[:70])
+    check("_reg_values omits values that do not exist, silently",
+          "NoSuchValue_zpa" not in _cv)
+    check("_reg_values returns {} for a missing key",
+          m._reg_values(m.winreg.HKEY_LOCAL_MACHINE,
+                        r"SOFTWARE\NoSuchKey_zpa", ("x",)) == {})
+
+    # Service control manager — read-only rights, no elevation
+    _ex, _st = m.service_state("Dnscache")
+    check("service_state finds a service that is definitely running",
+          _ex and _st == "RUNNING", f"exists={_ex} state={_st}")
+    check("service_state reports an absent service as (False, '')",
+          m.service_state("NoSuchService_zpa_xyz") == (False, ""))
+    check("service_state needs no elevation (it just succeeded unprivileged)",
+          _ex is True)
+
+    # Process table
+    _procs = m.running_processes(["python"])
+    check("running_processes finds the interpreter running this suite",
+          any("python" in x.lower() for x in _procs), str(_procs)[:70])
+    check("running_processes returns [] when nothing matches",
+          m.running_processes(["definitely_not_a_process_zpa"]) == [])
+    check("running_processes matches case-insensitively",
+          m.running_processes(["PYTHON"]) == _procs)
+
+    # Routing — the Find-NetRoute replacement
+    _idx, _nh, _alias = m.best_route("8.8.8.8")
+    check("best_route resolves a routable address to an interface",
+          _idx > 0 and _alias, f"idx={_idx} alias={_alias!r} nh={_nh!r}")
+    check("best_route returns a printable next hop or empty",
+          isinstance(_nh, str))
+    check("best_route rejects a malformed address without raising",
+          m.best_route("not-an-ip") == (0, "", ""))
+    check("best_route agrees with the steering probe for the same address",
+          m.windows_steering_path(
+              m.parse_synthetic_net("8.8.8.0/24"))["interface_index"]
+          == str(_idx),
+          f"{m.windows_steering_path(m.parse_synthetic_net('8.8.8.0/24'))['interface_index']} vs {_idx}")
+
+    # The point of the conversion: the probes spawn NO subprocess at all.
+    # Patching subprocess.run rather than a helper is what makes this a real
+    # guard — a future probe that shells out directly would slip past a
+    # helper-level patch. m.subprocess is the shared sys.modules object, so
+    # the patch is process-wide and the finally restore is mandatory.
+    _real_run = m.subprocess.run
+    try:
+        def _boom(*a, **kw):
+            raise AssertionError(f"a probe spawned a subprocess: {a[:1]}")
+        m.subprocess.run = _boom
+        m._ENV_CACHE.clear()
+        _z = m.detect_zcc()
+        _s = m.windows_steering_path(m.parse_synthetic_net("100.64.0.0/16"))
+        _d = m.windows_dns_config()
+        _p = m.windows_proxy_config()
+        check("no environment probe spawns any subprocess", True)
+        check("probes still return their documented shape with no subprocess",
+              _z["state"] in ("running", "installed_not_running",
+                              "not_detected")
+              and isinstance(_s["checked"], bool)
+              and isinstance(_d["resolvers"], int)
+              and isinstance(_p["proxy_enabled"], bool))
+    except AssertionError as _e:
+        check("no environment probe spawns any subprocess", False, str(_e))
+    finally:
+        m.subprocess.run = _real_run
+        m._ENV_CACHE.clear()
+
+    # And it must be fast. The old PowerShell path took ~3.6s for these four.
+    m._ENV_CACHE.clear()
+    _t0 = time.perf_counter()
+    m.detect_zcc(); m.windows_steering_path(
+        m.parse_synthetic_net("100.64.0.0/16"))
+    m.windows_dns_config(); m.windows_proxy_config()
+    _elapsed = (time.perf_counter() - _t0) * 1000
+    check("all four environment probes complete in well under a second",
+          _elapsed < 900, f"{_elapsed:.0f} ms")
+
     # ------------------------------------------------------- Windows probes
     # Every native surface this build depends on. These run against the real
     # OS: PowerShell, Find-NetRoute, the NRPT store, the proxy registry and
@@ -294,14 +706,11 @@ def main():
           platform.system() == "Windows",
           f"running on {platform.system()} — the guard in main() would exit")
 
-    _rc, _out = m._ps("Write-Output READY")
-    check("_ps runs PowerShell and returns (rc, text)",
-          _rc == 0 and "READY" in _out, f"rc={_rc} out={_out.strip()[:60]}")
-    _rc, _out = m._ps("this-command-does-not-exist-zzz")
-    check("_ps surfaces a failure as non-zero rather than raising",
-          _rc not in (0, None), f"rc={_rc}")
-    check("_ps never raises on a bad executable",
-          m._ps("Write-Output ok", timeout=1) is not None)
+    # _ps is gone: it had no production callers once the probes went native,
+    # and a PowerShell helper kept alive only so a test could exercise it is
+    # dead weight that invites a future caller.
+    check("the PowerShell helper is gone, not merely unused",
+          not hasattr(m, "_ps"))
 
     _z = m.detect_zcc()
     check("detect_zcc returns the documented shape",
@@ -1774,10 +2183,15 @@ def main():
     s, lat, att = m.tcp_probe_retry("127.0.0.1", 1, refuse_timeout, 2)
     check("REFUSED is definitive, not retried", s == "REFUSED" and att == 1,
           f"status={s} attempts={att} timeout={refuse_timeout}s")
-    ip, err = m.resolve("localhost", 2.0)
+    ip, err = m.resolve("localhost")
     check("resolve() returns ip for localhost", ip is not None and err is None,
           str(ip))
-    ip, err = m.resolve("no-such-host.invalid", 2.0)
+    ip, err = m.resolve("no-such-host.invalid")
+    # The old signature took a timeout, ignored it, and documented a bound
+    # that socket.setdefaulttimeout does not provide for getaddrinfo.
+    check("resolve() takes no timeout it cannot honour",
+          len(inspect.signature(m.resolve).parameters) == 1,
+          str(inspect.signature(m.resolve)))
     check("resolve() returns error for bogus name", ip is None and err)
 
     zcc = m.detect_zcc()

@@ -4,7 +4,7 @@ Admin tool for validating reachability to ZPA application segments from an
 endpoint running Zscaler Client Connector. Run it before ZPA is enabled for
 an account, again after, then diff the two runs.
 
-- Script: `zpa_segment_connectivity.py` (v2.0.0-windows)
+- Script: `zpa_segment_connectivity.py` (v2.1.0-windows)
 - Python 3.9+, standard library only — **no `pip install`**
 - **Windows only.** It uses `Find-NetRoute`, NRPT policy, the service
   registry and `SetThreadExecutionState`, and refuses to run anywhere else

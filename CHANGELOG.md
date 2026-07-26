@@ -1,5 +1,107 @@
 # Changelog
 
+## v2.1.0-windows
+PowerShell removed from the probe path, and four bugs that produced
+confidently wrong answers. Validated 444/444 on Windows 11 / Python 3.14.6,
+up from 385, plus an end-to-end run and two regression suites.
+
+### Startup is 71x faster
+
+The four environment probes spawned nine PowerShell processes. Each
+`powershell -NoProfile -Command` costs roughly 175ms of process startup
+before it does any work. They are now `winreg` and `ctypes` calls, and every
+native answer was checked to AGREE with the PowerShell answer it replaced —
+the same interface index, the same adapter, the same resolvers, the same
+NRPT count, the same Client Connector state.
+
+| probe | before | after |
+|---|---|---|
+| Client Connector detection | 935 ms | ~9 ms |
+| synthetic-range routing | 1,565 ms | ~0.1 ms |
+| DNS servers + NRPT | 1,107 ms | ~0.7 ms |
+| proxy | 239 ms | ~0.1 ms |
+| **all four** | **3,587 ms** | **50.5 ms** |
+
+- Service state through `OpenSCManager`/`QueryServiceStatusEx`, which needs
+  only read rights and so works unprivileged. Installed-but-stopped stays
+  distinct from absent, because the remedies differ.
+- Processes through `CreateToolhelp32Snapshot` rather than parsing
+  `tasklist`.
+- Routing through `GetBestRoute`, which also yields the next hop that the
+  previous implementation needed a second command to obtain.
+- NRPT read from both the Group Policy hive and the Dnscache hive. Client
+  Connector applies its policy locally, which writes the latter — reading
+  only the former would have missed it.
+- WinHTTP read through its own API instead of parsing the undocumented
+  binary registry blob behind it.
+
+Every ctypes binding declares `argtypes` and `restype`. Without them a
+64-bit handle is silently truncated; that defect occurred three times during
+development, so the validator now asserts it for all eleven bindings rather
+than leaving it to discipline.
+
+### Wrong answers
+
+- **An ALL-CAPS DNS export silently produced worthless verdicts.**
+  `_dns_row_get` documented case-insensitive column lookup and performed an
+  exact dictionary lookup. `RecordType`, `ResolvedIPs` and
+  `HasAnyInternalIP` all read as empty, so every name classified
+  `NOT_STEERED_UNKNOWN`, the run reported success, and the entire
+  cross-reference was meaningless. Now genuinely case-insensitive, and a
+  missing classifying column is called out rather than read as empty.
+- **A run whose filters matched nothing still printed a causal verdict.**
+  With `--phase pre` that wrote a zero-target `BASELINE CAPTURED` to disk to
+  be diffed later. It now refuses and names the filters responsible.
+- **`estimate_duration` ignored retries**, understating the worst case by
+  roughly half at the default `--retries 1` — and `confirm_run` gates on
+  that number, which `--yes` does not bypass.
+- **The metadata dictionary contained `slowest_segments` twice**, so a full
+  scan of every row was computed and discarded.
+
+### L7 verification
+
+A peer that accepts a connection and then says nothing used to cost twice
+the L7 budget, because the TLS read and the HTTP read each blocked a full
+timeout on the same dead peer. One shared deadline now covers both attempts.
+
+The result deliberately remains `L7_ERROR` rather than becoming
+`OPEN_NO_L7_DATA`. Those describe different situations, and collapsing them
+would report a slow application as a silent one — the precise misreading
+that a separate L7 budget exists to prevent. The second attempt keeps a
+generous floor so an application that fails TLS quickly but answers HTTP
+slowly is not misclassified by a small remainder.
+
+### Robustness
+
+- **Results survive an unwritable output directory.** They previously lived
+  only in memory until a single unguarded write; a read-only directory or a
+  path over MAX_PATH discarded an entire run at the last step. The CSV and
+  metadata now fall back to the temp directory and say so.
+- **Invalid numeric options are rejected at parse time.** `--workers 0`,
+  `--retries -1` and `--timeout 0` previously failed deep inside the run,
+  after the credential exchange, the full inventory fetch and the operator's
+  confirmation.
+- **The tenant store no longer claims a protection it did not verify.** It
+  asserted a numeric file mode, which describes nothing on NTFS, about a
+  file whose ACL may have failed to apply. It now reports what is actually true
+  and reads the ACL back to confirm it.
+- Console tools return OEM-encoded output while Python decoded it as ANSI;
+  a bad decode raised out of functions documented as never raising. All four
+  call sites decode leniently and the handlers catch it.
+- Startup sets the console output code page as well as the stream encoding.
+  Setting only the stream renders every non-ASCII character as mojibake in a
+  real console.
+- The Client Connector version was invisible to a 32-bit interpreter,
+  because the uninstall registry was read without the 64-bit view.
+- DNS resolvers were collected from every network interface the registry has
+  ever held, presenting disconnected adapters as live. Only interfaces
+  holding an address are reported.
+- The ACL check compared against English principal names and so mis-warned
+  on any localized Windows. It is now locale-independent by construction.
+- The module remains importable on other platforms, so the platform guard
+  can print a clear message instead of the interpreter raising an import
+  error first.
+
 ## v2.0.0-windows
 
 **Breaking: this build is now Windows-only.** It refuses to run anywhere

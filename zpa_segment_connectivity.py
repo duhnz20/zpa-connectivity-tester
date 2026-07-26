@@ -63,6 +63,7 @@ implements ZPA steering:
 import argparse
 import concurrent.futures
 import csv
+import ctypes
 import getpass
 import html
 import ipaddress
@@ -73,15 +74,26 @@ import random
 import re
 import socket
 import ssl
+import struct
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+# Guarded so the module still IMPORTS off Windows: main() must be reached to
+# print the clean "this tool requires Windows" message, and it cannot be
+# reached if the import itself dies with ModuleNotFoundError.
+try:
+    import winreg
+    from ctypes import wintypes
+except (ImportError, ValueError):
+    winreg = None
+    wintypes = None
 from datetime import datetime, timezone
 
-SCRIPT_VERSION = "2.0.0-windows"
+SCRIPT_VERSION = "2.1.0-windows"
 DEFAULT_API_BASE = "https://api.zsapi.net"
 OAUTH_AUDIENCE = "https://api.zscaler.com"
 # Zscaler's documented default synthetic range. It is TENANT-CONFIGURABLE:
@@ -128,6 +140,12 @@ L7_TIMEOUT_FACTOR = 4
 L7_TIMEOUT_FLOOR = 5.0
 L7_TIMEOUT_CEILING = 15.0
 
+# Floor for the plaintext attempt once the TLS attempt has eaten into the
+# shared budget. Kept generous: a peer that fails TLS fast but answers HTTP
+# slowly must not be flipped from HTTP:xxx to L7_ERROR by a stingy
+# remainder. --l7-timeout is the remedy when it is not enough.
+L7_MIN_SECOND_ATTEMPT = 1.0
+
 # An L7 result that proves an application answered. Everything else on an
 # OPEN port — no data, non-HTTP bytes, or an L7 error — means TCP reachability
 # was established without demonstrating that anything is serving.
@@ -168,6 +186,237 @@ MAX_RUN_SECONDS = 12 * 3600  # refuse runs whose worst case exceeds this
 # a single probe runs, so a run can say "Private Access is off" instead of
 # collecting a directory of false negatives and calling them failures.
 
+# --------------------------------------------------------------------------
+# Native Windows bindings
+# --------------------------------------------------------------------------
+#
+# Everything below asks Windows through winreg and ctypes rather than by
+# spawning PowerShell. That is not a micro-optimisation: measured on this
+# build, the four environment probes cost 3,587ms via PowerShell and 32ms
+# natively, because each `powershell -NoProfile -Command` costs ~175ms of
+# process startup before it does any work, and the probes made nine of them.
+#
+# Every binding below declares argtypes and restype. This is mandatory, not
+# tidiness: without them ctypes assumes a 32-bit int return and truncates
+# 64-bit HANDLEs, which fails silently or raises OverflowError. That exact
+# bug has now been hit three times in this codebase, so it is asserted in
+# the validator rather than left to discipline.
+
+# Loaded only on Windows so the module stays importable elsewhere; every
+# caller is reached only after main()'s platform guard has passed.
+if wintypes is not None:
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    _iph = ctypes.WinDLL("iphlpapi", use_last_error=True)
+
+    SC_MANAGER_CONNECT = 0x0001
+    SERVICE_QUERY_STATUS = 0x0004
+    SC_STATUS_PROCESS_INFO = 0
+    TH32CS_SNAPPROCESS = 0x00000002
+    SERVICE_STATES = {1: "STOPPED", 2: "START_PENDING", 3: "STOP_PENDING",
+                      4: "RUNNING", 5: "CONTINUE_PENDING", 6: "PAUSE_PENDING",
+                      7: "PAUSED"}
+
+
+    class _SERVICE_STATUS_PROCESS(ctypes.Structure):
+        _fields_ = [("dwServiceType", wintypes.DWORD),
+                    ("dwCurrentState", wintypes.DWORD),
+                    ("dwControlsAccepted", wintypes.DWORD),
+                    ("dwWin32ExitCode", wintypes.DWORD),
+                    ("dwServiceSpecificExitCode", wintypes.DWORD),
+                    ("dwCheckPoint", wintypes.DWORD),
+                    ("dwWaitHint", wintypes.DWORD),
+                    ("dwProcessId", wintypes.DWORD),
+                    ("dwServiceFlags", wintypes.DWORD)]
+
+
+    class _PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_wchar * 260)]
+
+
+    class _MIB_IPFORWARDROW(ctypes.Structure):
+        """Every field is a DWORD; only NextHop and IfIndex are read."""
+        _fields_ = [(n, wintypes.DWORD) for n in (
+            "dwForwardDest", "dwForwardMask", "dwForwardPolicy",
+            "dwForwardNextHop", "dwForwardIfIndex", "dwForwardType",
+            "dwForwardProto", "dwForwardAge", "dwForwardNextHopAS",
+            "dwForwardMetric1", "dwForwardMetric2", "dwForwardMetric3",
+            "dwForwardMetric4", "dwForwardMetric5")]
+
+
+    class _NET_LUID(ctypes.Structure):
+        _fields_ = [("Value", ctypes.c_ulonglong)]
+
+
+    class _WINHTTP_PROXY_INFO(ctypes.Structure):
+        _fields_ = [("dwAccessType", wintypes.DWORD),
+                    ("lpszProxy", wintypes.LPWSTR),
+                    ("lpszProxyBypass", wintypes.LPWSTR)]
+
+
+    _adv.OpenSCManagerW.restype = wintypes.HANDLE
+    _adv.OpenSCManagerW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                    wintypes.DWORD]
+    _adv.OpenServiceW.restype = wintypes.HANDLE
+    _adv.OpenServiceW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR,
+                                  wintypes.DWORD]
+    _adv.QueryServiceStatusEx.restype = wintypes.BOOL
+    _adv.QueryServiceStatusEx.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                          ctypes.c_void_p, wintypes.DWORD,
+                                          ctypes.POINTER(wintypes.DWORD)]
+    _adv.CloseServiceHandle.restype = wintypes.BOOL
+    _adv.CloseServiceHandle.argtypes = [wintypes.HANDLE]
+
+    _k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    _k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    _k32.Process32FirstW.restype = wintypes.BOOL
+    _k32.Process32FirstW.argtypes = [wintypes.HANDLE,
+                                     ctypes.POINTER(_PROCESSENTRY32W)]
+    _k32.Process32NextW.restype = wintypes.BOOL
+    _k32.Process32NextW.argtypes = [wintypes.HANDLE,
+                                    ctypes.POINTER(_PROCESSENTRY32W)]
+    _k32.CloseHandle.restype = wintypes.BOOL
+    _k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    _iph.GetBestRoute.restype = wintypes.DWORD
+    _iph.GetBestRoute.argtypes = [wintypes.DWORD, wintypes.DWORD,
+                                  ctypes.POINTER(_MIB_IPFORWARDROW)]
+    _iph.ConvertInterfaceIndexToLuid.restype = wintypes.ULONG
+    _iph.ConvertInterfaceIndexToLuid.argtypes = [wintypes.ULONG,
+                                                 ctypes.POINTER(_NET_LUID)]
+    _iph.ConvertInterfaceLuidToAlias.restype = wintypes.ULONG
+    _iph.ConvertInterfaceLuidToAlias.argtypes = [ctypes.POINTER(_NET_LUID),
+                                                 ctypes.c_wchar_p,
+                                                 ctypes.c_size_t]
+
+
+def _reg_values(root, path, wanted, view64=False):
+    """{name: value} for `wanted` under one key; missing names are omitted."""
+    access = winreg.KEY_READ | (winreg.KEY_WOW64_64KEY if view64 else 0)
+    out = {}
+    try:
+        key = winreg.OpenKey(root, path, 0, access)
+    except OSError:
+        return out
+    try:
+        for name in wanted:
+            try:
+                out[name] = winreg.QueryValueEx(key, name)[0]
+            except OSError:
+                pass
+    finally:
+        key.Close()
+    return out
+
+
+def _reg_subkeys(root, path, view64=False):
+    """Subkey names under a path, or [] if the path does not exist.
+
+    view64 forces the 64-bit view. Without it a 32-bit Python is redirected
+    into Wow6432Node and a 64-bit-installed ZCC is invisible.
+    """
+    access = winreg.KEY_READ | (winreg.KEY_WOW64_64KEY if view64 else 0)
+    try:
+        key = winreg.OpenKey(root, path, 0, access)
+    except OSError:
+        return []
+    try:
+        return [winreg.EnumKey(key, i)
+                for i in range(winreg.QueryInfoKey(key)[0])]
+    except OSError:
+        return []
+    finally:
+        key.Close()
+
+
+def service_state(name):
+    """(exists, state) for a Windows service. Needs no elevation.
+
+    SC_MANAGER_CONNECT + SERVICE_QUERY_STATUS are read-only rights granted
+    to ordinary users, so this works from an unprivileged shell. 'exists'
+    is reported separately from 'state' because an installed-but-stopped
+    service and an absent one call for different remedies.
+    """
+    scm = _adv.OpenSCManagerW(None, None, SC_MANAGER_CONNECT)
+    if not scm:
+        return (False, "")
+    try:
+        handle = _adv.OpenServiceW(scm, name, SERVICE_QUERY_STATUS)
+        if not handle:
+            return (False, "")
+        try:
+            status = _SERVICE_STATUS_PROCESS()
+            needed = wintypes.DWORD()
+            if not _adv.QueryServiceStatusEx(
+                    handle, SC_STATUS_PROCESS_INFO, ctypes.byref(status),
+                    ctypes.sizeof(status), ctypes.byref(needed)):
+                return (True, "unknown")
+            return (True, SERVICE_STATES.get(status.dwCurrentState,
+                                             str(status.dwCurrentState)))
+        finally:
+            _adv.CloseServiceHandle(handle)
+    finally:
+        _adv.CloseServiceHandle(scm)
+
+
+def running_processes(substrings):
+    """Process image names matching any substring, case-insensitively."""
+    snap = _k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap == wintypes.HANDLE(-1).value or not snap:
+        return []
+    try:
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        found = set()
+        if not _k32.Process32FirstW(snap, ctypes.byref(entry)):
+            return []
+        subs = [x.lower() for x in substrings]
+        while True:
+            name = entry.szExeFile
+            low = name.lower()
+            if any(x in low for x in subs):
+                found.add(name)
+            if not _k32.Process32NextW(snap, ctypes.byref(entry)):
+                break
+        return sorted(found)
+    finally:
+        _k32.CloseHandle(snap)
+
+
+def best_route(dest_ip):
+    """(if_index, next_hop, alias) the stack would use for dest_ip.
+
+    GetBestRoute resolves what would actually happen to a packet, which is
+    the same question `route print` answers but without parsing text. It is
+    IPv4-only, which matches the tool: ZPA synthetic addresses are IPv4.
+    Returns (0, "", "") when no route exists.
+    """
+    try:
+        dest = struct.unpack("<L", socket.inet_aton(dest_ip))[0]
+    except (OSError, struct.error):
+        return (0, "", "")
+    row = _MIB_IPFORWARDROW()
+    if _iph.GetBestRoute(dest, 0, ctypes.byref(row)) != 0:
+        return (0, "", "")
+    idx = int(row.dwForwardIfIndex)
+    nh = socket.inet_ntoa(struct.pack("<L", row.dwForwardNextHop))
+    alias = ""
+    luid = _NET_LUID()
+    if _iph.ConvertInterfaceIndexToLuid(idx, ctypes.byref(luid)) == 0:
+        buf = ctypes.create_unicode_buffer(256)
+        if _iph.ConvertInterfaceLuidToAlias(ctypes.byref(luid), buf, 256) == 0:
+            alias = buf.value
+    return (idx, nh, alias)
+
+
 WIN_CMD_TIMEOUT = 25
 
 # Service names, not just process names. A service can be installed and
@@ -194,25 +443,9 @@ def _env(key, producer, refresh=False):
     return _ENV_CACHE[key]
 
 
-def _ps(script, timeout=WIN_CMD_TIMEOUT):
-    """Run PowerShell, returning (rc, text). Never raises.
-
-    -NoProfile because a user profile can print banners that corrupt
-    parsing, and is slow. Failure returns (None, "") so callers degrade to
-    "unknown" rather than aborting a run that is otherwise fine.
-    """
-    try:
-        p = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive",
-             "-ExecutionPolicy", "Bypass", "-Command", script],
-            capture_output=True, text=True, timeout=timeout)
-        return p.returncode, (p.stdout or "") + (p.stderr or "")
-    except (OSError, subprocess.SubprocessError):
-        return None, ""
-
-
 def _detect_zcc_uncached():
-    """Client Connector state from services, processes and the registry.
+    """Client Connector state from the service registry, the SCM and the
+    process table — no subprocess.
 
     'installed but not running' is reported distinctly from 'not detected',
     because the remedy differs: start the service versus install the client.
@@ -223,42 +456,39 @@ def _detect_zcc_uncached():
             "processes_found": [], "installed_version": "",
             "signals": [], "state": "not_detected"}
 
-    rc, out = _ps(
-        "Get-Service -ErrorAction SilentlyContinue | "
-        "Where-Object { $_.Name -match 'ZSA|Zscaler' } | "
-        "ForEach-Object { \"$($_.Name)=$($_.Status)\" }")
-    if rc == 0:
-        for line in out.splitlines():
-            line = line.strip()
-            if "=" not in line:
-                continue
-            name, _, status = line.partition("=")
-            info["services"].append(line)
-            if status.strip().lower() == "running":
-                info["services_running"].append(name.strip())
-        if info["services"]:
-            info["signals"].append("service")
+    # Service names come from the registry (which lists every installed
+    # service regardless of state); live state comes from the SCM.
+    names = [n for n in _reg_subkeys(
+        winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services")
+        if "zsa" in n.lower() or "zscaler" in n.lower()]
+    for name in sorted(names):
+        exists, state = service_state(name)
+        if not exists:
+            continue
+        info["services"].append(f"{name}={state}")
+        if state == "RUNNING":
+            info["services_running"].append(name)
+    if info["services"]:
+        info["signals"].append("service")
 
-    rc, out = _ps(
-        "Get-Process -ErrorAction SilentlyContinue | "
-        "Where-Object { $_.ProcessName -match 'ZSA|Zscaler' } | "
-        "Select-Object -Expand ProcessName -Unique")
-    if rc == 0 and out.strip():
-        info["processes_found"] = sorted({p.strip() for p in out.split()
-                                          if p.strip()})
-        if info["processes_found"]:
-            info["signals"].append("process")
+    info["processes_found"] = running_processes(ZCC_PROCESS_HINTS)
+    if info["processes_found"]:
+        info["signals"].append("process")
 
-    rc, out = _ps(
-        "Get-ItemProperty "
-        "'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*',"
-        "'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion"
-        "\\Uninstall\\*' -ErrorAction SilentlyContinue | "
-        "Where-Object { $_.DisplayName -match 'Zscaler' } | "
-        "Select-Object -First 1 -Expand DisplayVersion")
-    if rc == 0 and out.strip():
-        info["installed_version"] = out.strip().splitlines()[0]
-        info["signals"].append("registry")
+    for hive in (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                 r"SOFTWARE\WOW6432Node\Microsoft\Windows"
+                 r"\CurrentVersion\Uninstall"):
+        for sub_name in _reg_subkeys(winreg.HKEY_LOCAL_MACHINE, hive,
+                                     view64=True):
+            vals = _reg_values(winreg.HKEY_LOCAL_MACHINE,
+                               hive + "\\" + sub_name,
+                               ("DisplayName", "DisplayVersion"), view64=True)
+            if "zscaler" in str(vals.get("DisplayName", "")).lower():
+                info["installed_version"] = str(vals.get("DisplayVersion", ""))
+                info["signals"].append("registry")
+                break
+        if info["installed_version"]:
+            break
 
     if info["services_running"] or info["processes_found"]:
         info["state"] = "running"
@@ -270,46 +500,29 @@ def _detect_zcc_uncached():
 def _windows_steering_path_uncached(net=None):
     """Ask the routing table whether a path into the synthetic range exists.
 
-    Find-NetRoute is the Windows equivalent of `route -n get`: it resolves
-    what the stack would actually do with a packet to that address, rather
-    than guessing from the adapter list. Keeping this independent of the
-    synthetic-IP observation lets a negative result say *why* — no adapter
-    claims the range at all, versus one does but no name resolved into it.
+    GetBestRoute resolves what the stack would actually do with a packet to
+    that address, rather than guessing from the adapter list. Keeping this
+    independent of the synthetic-IP observation lets a negative result say
+    *why*: no adapter claims the range at all, versus one does but no name
+    resolved into it.
     """
     net = net or ZPA_SYNTHETIC_NET
     probe_ip = str(next(net.hosts()))
+    # No adapter_description key: the previous implementation declared one
+    # and never populated it, so every consumer read an empty string that
+    # looked like an answer.
     info = {"checked": False, "probe_ip": probe_ip, "interface": "",
-            "interface_index": "", "next_hop": "", "via_tunnel": None,
-            "adapter_description": ""}
-
-    rc, out = _ps(
-        f"$r = Find-NetRoute -RemoteIPAddress {probe_ip} -ErrorAction Stop | "
-        "Select-Object -First 1; "
-        "\"IF=$($r.InterfaceAlias)\"; \"IDX=$($r.InterfaceIndex)\"; "
-        "\"NH=$($r.NextHop)\"")
-    if rc != 0:
-        return info
-    for line in out.splitlines():
-        line = line.strip()
-        if line.startswith("IF="):
-            info["interface"] = line[3:].strip()
-        elif line.startswith("IDX="):
-            info["interface_index"] = line[4:].strip()
-        elif line.startswith("NH="):
-            info["next_hop"] = line[3:].strip()
-    if not info["interface"]:
+            "interface_index": "", "next_hop": "", "via_tunnel": None}
+    idx, next_hop, alias = best_route(probe_ip)
+    if not idx:
         return info
     info["checked"] = True
-
-    rc, out = _ps(
-        f"(Get-NetAdapter -InterfaceIndex {info['interface_index']} "
-        "-ErrorAction SilentlyContinue).InterfaceDescription"
-        if info["interface_index"] else
-        f"(Get-NetAdapter -Name '{info['interface']}' "
-        "-ErrorAction SilentlyContinue).InterfaceDescription")
-    desc = (out or "").strip()
-    info["adapter_description"] = desc
-    blob = (info["interface"] + " " + desc).lower()
+    info["interface_index"] = str(idx)
+    info["interface"] = alias
+    # 0.0.0.0 as a next hop means on-link, which is not a useful thing to
+    # print, so it is normalised away rather than shown as an address.
+    info["next_hop"] = "" if next_hop == "0.0.0.0" else next_hop
+    blob = alias.lower()
     info["via_tunnel"] = any(h in blob for h in ZCC_ADAPTER_HINTS)
     return info
 
@@ -320,65 +533,89 @@ def _windows_dns_config_uncached():
     ZCC drives per-domain resolution through the Name Resolution Policy
     Table, so NRPT rules are the authoritative signal for whether a name
     will be resolved by ZPA, and their absence on an enrolled host is worth
-    seeing.
+    seeing. Both live in the registry, so neither needs a subprocess.
+
+    The policy lives under two possible keys: Group Policy writes the
+    Policies hive, while a locally-applied policy (which is how ZCC applies
+    it) writes the Dnscache one. Both are read.
     """
     info = {"resolvers": 0, "servers": [], "nrpt_rules": 0,
             "nrpt_namespaces": []}
-    rc, out = _ps(
-        "Get-DnsClientServerAddress -AddressFamily IPv4 "
-        "-ErrorAction SilentlyContinue | "
-        "Where-Object { $_.ServerAddresses } | "
-        "ForEach-Object { $_.ServerAddresses } | Sort-Object -Unique")
-    if rc == 0:
-        info["servers"] = [s.strip() for s in out.split() if s.strip()]
-        info["resolvers"] = len(info["servers"])
 
-    rc, out = _ps(
-        "$n = Get-DnsClientNrptPolicy -ErrorAction SilentlyContinue; "
-        "\"COUNT=$(@($n).Count)\"; "
-        "$n | Select-Object -First 8 -Expand Namespace")
-    if rc == 0:
-        for line in out.splitlines():
-            line = line.strip()
-            if line.startswith("COUNT="):
-                try:
-                    info["nrpt_rules"] = int(line[6:])
-                except ValueError:
-                    pass
-            elif line:
-                info["nrpt_namespaces"].append(line)
+    servers = []
+    base = (r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
+            r"\Interfaces")
+    # Only interfaces that currently hold an address are reported. The
+    # registry keeps a key for every adapter the machine has ever had, so
+    # scraping all of them surfaces resolvers from disconnected VPNs and
+    # removed NICs as if they were live.
+    for guid in _reg_subkeys(winreg.HKEY_LOCAL_MACHINE, base):
+        vals = _reg_values(winreg.HKEY_LOCAL_MACHINE, base + "\\" + guid,
+                           ("NameServer", "DhcpNameServer", "IPAddress",
+                            "DhcpIPAddress"))
+        addrs = vals.get("IPAddress") or vals.get("DhcpIPAddress") or ""
+        live = [a for a in (addrs if isinstance(addrs, (list, tuple))
+                            else [addrs]) if a and str(a) != "0.0.0.0"]
+        if not live:
+            continue
+        for key in ("NameServer", "DhcpNameServer"):
+            raw = vals.get(key)
+            if raw:
+                servers.extend(str(raw).replace(",", " ").split())
+    info["servers"] = sorted(set(servers))
+    info["resolvers"] = len(info["servers"])
+
+    seen = []
+    for policy in (r"SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
+                   r"\DnsPolicyConfig",
+                   r"SYSTEM\CurrentControlSet\Services\Dnscache"
+                   r"\Parameters\DnsPolicyConfig"):
+        for rule in _reg_subkeys(winreg.HKEY_LOCAL_MACHINE, policy):
+            vals = _reg_values(winreg.HKEY_LOCAL_MACHINE,
+                               policy + "\\" + rule, ("Name",))
+            raw = vals.get("Name")
+            if raw is None:
+                continue
+            seen.append(rule)
+            for ns in (raw if isinstance(raw, (list, tuple)) else [raw]):
+                if ns and ns not in info["nrpt_namespaces"]:
+                    info["nrpt_namespaces"].append(str(ns))
+    info["nrpt_rules"] = len(seen)
+    info["nrpt_namespaces"] = info["nrpt_namespaces"][:8]
     return info
 
 
 def _windows_proxy_config_uncached():
     """WinINET (per-user) and WinHTTP (system) proxy settings.
 
-    A proxy in the path changes what a successful connect means, so the run
-    records both rather than assuming direct egress.
+    A proxy in the path changes what a successful connect means, so both
+    are recorded rather than assuming direct egress. WinINET is a registry
+    read; WinHTTP is read through its own API rather than by parsing the
+    REG_BINARY blob that backs it, which has no documented layout.
     """
     info = {"proxy_enabled": False, "proxy_server": "", "autoconfig_url": "",
             "winhttp": ""}
-    rc, out = _ps(
-        "$k = Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows"
-        "\\CurrentVersion\\Internet Settings' -ErrorAction SilentlyContinue; "
-        "\"EN=$($k.ProxyEnable)\"; \"SRV=$($k.ProxyServer)\"; "
-        "\"PAC=$($k.AutoConfigURL)\"")
-    if rc == 0:
-        for line in out.splitlines():
-            line = line.strip()
-            if line.startswith("EN="):
-                info["proxy_enabled"] = line[3:].strip() not in ("", "0")
-            elif line.startswith("SRV="):
-                info["proxy_server"] = line[4:].strip()
-            elif line.startswith("PAC="):
-                info["autoconfig_url"] = line[4:].strip()
+    vals = _reg_values(
+        winreg.HKEY_CURRENT_USER,
+        r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        ("ProxyEnable", "ProxyServer", "AutoConfigURL"))
+    info["proxy_enabled"] = bool(vals.get("ProxyEnable"))
+    info["proxy_server"] = str(vals.get("ProxyServer") or "")
+    info["autoconfig_url"] = str(vals.get("AutoConfigURL") or "")
+
     try:
-        p = subprocess.run(["netsh", "winhttp", "show", "proxy"],
-                           capture_output=True, text=True,
-                           timeout=WIN_CMD_TIMEOUT)
-        info["winhttp"] = " ".join((p.stdout or "").split())
-    except (OSError, subprocess.SubprocessError):
-        pass
+        winhttp = ctypes.WinDLL("winhttp", use_last_error=True)
+        winhttp.WinHttpGetDefaultProxyConfiguration.restype = wintypes.BOOL
+        winhttp.WinHttpGetDefaultProxyConfiguration.argtypes = [
+            ctypes.POINTER(_WINHTTP_PROXY_INFO)]
+        cfg = _WINHTTP_PROXY_INFO()
+        if winhttp.WinHttpGetDefaultProxyConfiguration(ctypes.byref(cfg)):
+            if cfg.dwAccessType == 3 and cfg.lpszProxy:
+                info["winhttp"] = f"proxy {cfg.lpszProxy}"
+            else:
+                info["winhttp"] = "direct access (no proxy server)"
+    except (OSError, AttributeError, ValueError):
+        info["winhttp"] = "unavailable"
     return info
 
 
@@ -465,7 +702,7 @@ def flush_dns_cache():
         ok = p.returncode == 0
         return ok, ("ipconfig /flushdns=ok" if ok
                     else f"ipconfig /flushdns=rc{p.returncode}")
-    except (OSError, subprocess.SubprocessError) as e:
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
         return False, f"ipconfig /flushdns failed ({type(e).__name__})"
 
 
@@ -698,7 +935,9 @@ def tenant_store_path():
 
 # Principals that may legitimately appear on the tenant store's ACL. Anything
 # else means another account can read a file that may hold a client secret.
-ACL_ALLOWED = ("NT AUTHORITY\\SYSTEM", "BUILTIN\\Administrators")
+# No allow-list of principal names: see _warn_if_readable_by_others. A name
+# list would have to be localized, and the restricted state is a single ACE
+# anyway.
 
 
 def _current_user():
@@ -711,11 +950,11 @@ def _current_user():
     form icacls actually accepts, so ask it rather than assemble one.
     """
     try:
-        p = subprocess.run(["whoami"], capture_output=True, text=True,
+        p = subprocess.run(["whoami"], capture_output=True, text=True, errors="replace",
                            timeout=WIN_CMD_TIMEOUT)
         if p.returncode == 0 and p.stdout.strip():
             return p.stdout.strip()
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         pass
     host = os.environ.get("COMPUTERNAME", "")
     usr = os.environ.get("USERNAME") or getpass.getuser()
@@ -734,26 +973,32 @@ def _secure_acl(path):
     try:
         p = subprocess.run(["icacls", path, "/inheritance:r",
                             "/grant:r", f"{_current_user()}:(F)"],
-                           capture_output=True, text=True,
+                           capture_output=True, text=True, errors="replace",
                            timeout=WIN_CMD_TIMEOUT)
         if p.returncode != 0:
             return False, f"icacls rc{p.returncode}"
         return True, f"ACL restricted to {_current_user()}"
-    except (OSError, subprocess.SubprocessError) as e:
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
         return False, f"icacls failed ({type(e).__name__})"
 
 
 def _warn_if_readable_by_others(path):
     """Read the real ACL back and warn if anyone else can read the file."""
     try:
-        p = subprocess.run(["icacls", path], capture_output=True, text=True,
+        p = subprocess.run(["icacls", path], capture_output=True, text=True, errors="replace",
                            timeout=WIN_CMD_TIMEOUT)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return
     if p.returncode != 0:
         return
+    # Locale-independent by construction: _secure_acl grants exactly one
+    # principal and strips inheritance, so the expected steady state is a
+    # single ACE. Anything else means someone else can read the file,
+    # whatever language Windows names them in — the previous version
+    # compared against the English strings "NT AUTHORITY\\SYSTEM" and
+    # "BUILTIN\\Administrators" and so mis-warned on localized Windows.
     me = _current_user().lower()
-    allowed = {a.lower() for a in ACL_ALLOWED} | {me}
+    allowed = {me}
     others = []
     first = True
     for line in (p.stdout or "").splitlines():
@@ -794,12 +1039,16 @@ def load_tenant_store():
 
 
 def save_tenant_store(doc):
-    """Write the store, then restrict its ACL and say whether that worked.
+    """Write the store, restrict its ACL, and return (path, restricted).
 
-    Order matters: the file is created first (it cannot be ACL'd before it
-    exists), so it is written with no secret-bearing content until the ACL
-    is applied — the caller only stores a secret after opting in, and the
-    restriction is reported rather than assumed.
+    The file must exist before it can be ACL'd, so for a brief moment its
+    contents — which may include a client secret the operator opted into
+    storing — sit under the inherited ACL. In a user profile that means
+    user + SYSTEM + Administrators, not world-readable, but it is not the
+    restricted state either. The window is reported honestly rather than
+    papered over, and the ACL is read back so the caller can say what is
+    actually true instead of asserting a numeric file mode, which describes
+    nothing on NTFS.
     """
     path = tenant_store_path()
     parent = os.path.dirname(path)
@@ -810,7 +1059,11 @@ def save_tenant_store(doc):
     if not ok:
         print(f"[!] Could not restrict {path}: {detail}")
         print("    Anyone who can read your profile can read this file.")
-    return path
+    else:
+        # The docstring used to claim the ACL was read back; it was not.
+        # Make the claim true rather than quietly dropping it.
+        _warn_if_readable_by_others(path)
+    return path, ok
 
 
 def find_tenant(doc, name):
@@ -970,7 +1223,7 @@ def run_tenants(args):
 
     print("\n  The client secret can be saved too, but it is stored in "
           "PLAINTEXT in\n"
-          f"  {path} (permissions 0600). By default this tool never writes\n"
+          f"  {path} (ACL restricted to your account). By default this tool never writes\n"
           "  the secret to disk and prompts for it each run instead.")
     save_secret = ask("  Save the client secret as well? [y/N]: ",
                       "ERROR: no terminal.").strip().lower() in ("y", "yes")
@@ -990,8 +1243,13 @@ def run_tenants(args):
     doc.setdefault("tenants", [])
     doc["tenants"] = [x for x in doc["tenants"] if x is not existing]
     doc["tenants"].append(entry)
-    save_tenant_store(doc)
-    print(f"\nSaved tenant '{name}' to {path} (mode 0600)"
+    path, restricted = save_tenant_store(doc)
+    # Report what is actually true. A numeric file mode has no meaning on
+    # NTFS, and asserting one while the ACL may have failed to apply was the
+    # tool telling the operator something it had not checked.
+    acl = (f"ACL restricted to {_current_user()}" if restricted
+           else "WARNING: ACL not restricted — see the message above")
+    print(f"\nSaved tenant '{name}' to {path} ({acl})"
           + ("  [secret stored]" if secret else "  [secret not stored]"))
     if is_prod:
         print("Marked PRODUCTION — selecting it will require confirming "
@@ -1582,10 +1840,19 @@ def _csv_bool(value):
 
 
 def _dns_row_get(row, *names):
-    """Case-insensitive column read; the export's casing is not guaranteed."""
-    for n in names:
-        if n in row:
-            return (row[n] or "").strip()
+    """Case-insensitive column read; the export's casing is not guaranteed.
+
+    This used to claim case-insensitivity while doing an exact dict lookup,
+    which meant an ALL-CAPS export parsed without error and silently
+    produced NOT_STEERED_UNKNOWN for every name: RecordType, ResolvedIPs and
+    HasAnyInternalIP all read as empty, so nothing could be classified. The
+    run looked successful and every verdict was worthless.
+    """
+    low = {str(k).strip().lower(): v for k, v in row.items() if k}
+    for name in names:
+        key = str(name).strip().lower()
+        if key in low:
+            return (low[key] or "").strip()
     return ""
 
 
@@ -1633,6 +1900,18 @@ def load_dns_csv(path, args):
                 sys.exit(f"ERROR: {path} has no 'Name' column — this does "
                          "not look like a DNS destinations export. Columns "
                          f"found: {', '.join(str(f) for f in fields[:8])}")
+            # A missing column is indistinguishable from an empty one once
+            # rows are being read, and the consequence is silent: every name
+            # classifies as NOT_STEERED_UNKNOWN. Say so up front instead.
+            present = {str(f).strip().lower() for f in fields if f}
+            absent = [c for c in ("RecordType", "LookupStatus", "ResolvedIPs",
+                                  "HasAnyInternalIP", "OnlyExternalIPs")
+                      if c.lower() not in present]
+            if absent:
+                print(f"[!] {os.path.basename(path)} has no "
+                      f"{', '.join(absent)} column(s). Names will still be "
+                      "probed, but the cross-reference cannot classify what "
+                      "it cannot read.")
             for raw in reader:
                 stats["rows"] += 1
                 name = _dns_row_get(raw, "Name", "name", "NAME").lower()
@@ -2006,9 +2285,15 @@ def estimate_duration(n_probes, args):
     immediately. A real run lands between, but the worst case is the number
     that matters when deciding whether to start at all.
     """
-    workers = max(1, int(getattr(args, "workers", 20) or 20))
-    timeout = float(getattr(args, "timeout", 5.0) or 5.0)
-    return n_probes / (workers * 200.0), n_probes * timeout / workers
+    workers = max(1, int(getattr(args, "workers", 400) or 400))
+    timeout = float(getattr(args, "timeout", 3.0) or 3.0)
+    # Each retry is another full timeout plus the jittered backoff in
+    # tcp_probe_retry, so ignoring retries understated the worst case by
+    # roughly 2x at the default --retries 1 — and confirm_run gates on this
+    # number, which --yes does not bypass.
+    attempts = int(getattr(args, "retries", 0) or 0) + 1
+    worst = n_probes * (attempts * timeout + (attempts - 1) * 0.35) / workers
+    return n_probes / (workers * 200.0), worst
 
 
 def confirm_run(n_probes, args):
@@ -2053,11 +2338,15 @@ def confirm_run(n_probes, args):
 # Probing
 # --------------------------------------------------------------------------
 
-def resolve(domain, timeout):
+def resolve(domain):
     """Resolve a domain; returns (ip or None, error or None).
 
-    getaddrinfo has no per-call timeout, so the process-wide default is set
-    once in run_test() rather than mutated from worker threads.
+    There is deliberately no timeout parameter. getaddrinfo has no per-call
+    timeout and socket.setdefaulttimeout does not bound it — that only
+    stamps newly created socket objects, while getaddrinfo goes straight to
+    the platform resolver. The previous signature took a timeout, ignored
+    it, and documented a bound that did not exist. Windows applies its own
+    bounded per-server retry ladder, which is what actually limits this.
     """
     try:
         infos = socket.getaddrinfo(domain, None, socket.AF_INET,
@@ -2128,8 +2417,11 @@ def tcp_probe_retry(host, port, timeout, retries):
     intermittent connector behaviour is visible rather than averaged away.
     """
     attempts = 0
-    status, latency = "TIMEOUT", None
-    for i in range(retries + 1):
+    # Seeded NOT_PROBED, not TIMEOUT: if the loop somehow never runs, an
+    # unprobed unit must not be readable as "nothing answered", which the
+    # summary treats as evidence about steering.
+    status, latency = "NOT_PROBED", None
+    for i in range(max(1, retries + 1)):
         attempts += 1
         status, latency = tcp_probe(host, port, timeout)
         if status in ("OPEN", "REFUSED"):
@@ -2186,6 +2478,16 @@ def l7_probe(host, port, timeout, sni=None):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    # One budget for the whole L7 exchange, not one per attempt. A peer that
+    # accepts and then hangs used to cost 2x l7_timeout (24s at the default
+    # --timeout 3) because the TLS read and the HTTP read each blocked a
+    # full budget on the same dead peer.
+    #
+    # The outcome deliberately stays L7_ERROR rather than OPEN_NO_L7_DATA:
+    # those mean different things (see L7_MEANINGS), and collapsing them
+    # would report a slow application as a silent one — the exact
+    # misreading l7_timeout_for exists to prevent.
+    deadline = time.monotonic() + timeout
     try:
         with socket.create_connection((host, port), timeout=timeout) as sock:
             try:
@@ -2194,7 +2496,13 @@ def l7_probe(host, port, timeout, sni=None):
             except (ssl.SSLError, OSError):
                 pass
         # not TLS — try a plaintext HTTP request on a fresh connection
-        with socket.create_connection((host, port), timeout=timeout) as sock:
+        remaining = deadline - time.monotonic()
+        if remaining <= L7_MIN_SECOND_ATTEMPT:
+            # Same string the second attempt would have produced, so the
+            # operator's remedy (raise --l7-timeout) is unchanged.
+            return "L7_ERROR:timed out"
+        with socket.create_connection((host, port),
+                                      timeout=remaining) as sock:
             sock.sendall(b"HEAD / HTTP/1.0\r\nHost: "
                          + (sni or host).encode() + b"\r\n\r\n")
             raw = sock.recv(128)
@@ -2231,7 +2539,7 @@ def resolve_target(target, args):
     if target["kind"] in UNVERIFIABLE_KINDS:
         return {"ip": target["probe_domain"], "intercepted": "N/A",
                 "sni": None, "dns_err": None}
-    ip, dns_err = resolve(target["probe_domain"], args.timeout)
+    ip, dns_err = resolve(target["probe_domain"])
     if dns_err:
         return {"ip": "", "intercepted": "", "sni": target["probe_domain"],
                 "dns_err": dns_err}
@@ -2794,6 +3102,33 @@ def segment_rollup(all_rows):
     return segs
 
 
+def _write_or_fallback(path, write_fn, label):
+    """Write via write_fn(path); on OSError retry under %TEMP%.
+
+    Results live only in memory until this call. A read-only output
+    directory, a full disk or a path over MAX_PATH would otherwise discard
+    an entire multi-hour run at the last step. Losing the run is strictly
+    worse than writing it somewhere the operator did not ask for, so the
+    fallback is taken and printed rather than raising.
+    """
+    try:
+        write_fn(path)
+        return path
+    except OSError as e:
+        alt_dir = os.path.join(tempfile.gettempdir(), "zpa-test-results")
+        alt = os.path.join(alt_dir, os.path.basename(path))
+        print(f"[!] Could not write {label} to {path}: {e}")
+        try:
+            os.makedirs(alt_dir, exist_ok=True)
+            write_fn(alt)
+            print(f"    Wrote it to {alt} instead — the run is not lost.")
+            return alt
+        except OSError as e2:
+            print(f"[!] The fallback also failed ({e2}). "
+                  f"This run's {label} could not be saved.")
+            return ""
+
+
 def run_test(args):
     args.scope_resolved = choose_scope(args)
     # Normalised once rather than read defensively in eight places. A
@@ -2960,12 +3295,21 @@ def run_test(args):
         print("    refusal proves the path works. Raise --timeout to "
               "distinguish them.")
 
+    if not targets:
+        sys.exit(
+            "ERROR: no targets to probe — every entry was filtered out.\n"
+            f"       {stats['segments_matched']} segment(s) matched the "
+            "filters. Check --segment, --sipa-only, --enabled-only and\n"
+            "       --sample-domains. Refusing to write a run whose verdict "
+            "would assert a cause from zero evidence.")
+
     n_probes = estimate_probes(targets)
     print(f"[*] {len(targets)} targets / ~{n_probes} probes planned"
           + (f" (+ up to {args.retries} retry each)" if args.retries else ""))
     confirm_run(n_probes, args)
 
-    # getaddrinfo takes no per-call timeout; set the process default once
+    # Bounds connects made by socket objects created after this point. It
+    # does NOT bound getaddrinfo, which is why resolve() takes no timeout.
     socket.setdefaulttimeout(args.timeout)
     started = datetime.now(timezone.utc)
 
@@ -3066,7 +3410,11 @@ def run_test(args):
         annotate_dns_rows(all_rows, targets)
 
     out_dir = os.path.abspath(os.path.expanduser(args.output_dir))
-    os.makedirs(out_dir, exist_ok=True)
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:
+        # Not fatal: _write_or_fallback will place the results under %TEMP%.
+        print(f"[!] Could not create {out_dir}: {e}")
     ts = started.strftime("%Y%m%dT%H%M%SZ")
     # sanitize: keep the filename portable across platforms
     host = "".join(ch if ch.isalnum() or ch in "-_" else "-"
@@ -3078,10 +3426,14 @@ def run_test(args):
     # here), so a segment name outside it would raise UnicodeEncodeError at
     # this line — after every probe had already run.
     fieldnames = CSV_FIELDS + (DNS_CSV_FIELDS if args.dns_csv else [])
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        w.writerows(all_rows)
+
+    def _write_csv(target):
+        with open(target, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            w.writerows(all_rows)
+
+    out_path = _write_or_fallback(out_path, _write_csv, "results CSV")
 
     tcp_rows = [r for r in all_rows if r["protocol"] == "tcp"
                 and r["status"] != "NO_TCP_PORTS"]
@@ -3153,13 +3505,15 @@ def run_test(args):
         "slowest_segments": [{"segment": s, "median_ms": m, "probes": n}
                              for s, m, n in slowest_segments(all_rows)],
 
-        "slowest_segments": [{"segment": s, "median_ms": m, "probes": n}
-                             for s, m, n in slowest_segments(all_rows)],
         "intercepted_domain_list": sorted(intercepted),
     }
     meta_path = os.path.join(out_dir, stem + ".meta.json")
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
+
+    def _write_meta(target):
+        with open(target, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+
+    meta_path = _write_or_fallback(meta_path, _write_meta, "metadata")
 
     print()
     print(f"=== {args.phase.upper()} run summary "
@@ -4272,8 +4626,19 @@ def main():
                  "SetThreadExecutionState, none of which exist on "
                  f"{platform.system()}.")
 
-    # Windows consoles/redirects can default to a legacy code page; force
-    # UTF-8 so the report text never dies on an encoding error.
+    # A Windows console defaults to an OEM code page (437 is common) while
+    # Python defaults the stream to cp1252. Reconfiguring the stream to
+    # UTF-8 without also telling the CONSOLE makes every non-ASCII glyph
+    # render as mojibake, so both must be set, and before anything prints.
+    #
+    # SetConsoleOutputCP fails harmlessly when stdout is a pipe or a file
+    # rather than a console — which is exactly when it is not needed.
+    try:
+        ctypes.windll.kernel32.SetConsoleOutputCP.argtypes = [wintypes.UINT]
+        ctypes.windll.kernel32.SetConsoleOutputCP.restype = wintypes.BOOL
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)   # CP_UTF8
+    except (AttributeError, OSError, ValueError):
+        pass
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -4304,8 +4669,10 @@ def main():
         epilog="Saves the OneAPI values per tenant so a pilot spanning a "
                "model and a production tenant does not mean retyping four "
                "values per run.\n\n"
-               "The store lives at ~/.zpa-connectivity-tester/tenants.json "
-               "(mode 0600; override with $ZPA_TENANT_STORE).\n"
+               "The store lives at "
+               "%USERPROFILE%\\.zpa-connectivity-tester\\tenants.json, with "
+               "its ACL\nrestricted to your account and read back to "
+               "confirm it (override with\n$ZPA_TENANT_STORE).\n"
                "The client secret is only written if you opt in — by default "
                "it is prompted each run and never touches disk.\n\n"
                "  tenants add [name]     save a tenant interactively\n"
@@ -4506,6 +4873,27 @@ def main():
     # Reject rather than ignore: these subcommands take the range from the
     # metadata written alongside the CSV, so honouring the flag here would
     # mean re-labelling a finished run with a range it was not measured on.
+    # Validated here rather than at first use: --workers 0 and --timeout -1
+    # are plausible typos that otherwise raise deep inside run_test, after
+    # the OAuth token fetch, the full paged inventory pull and the
+    # operator's confirmation. The cost of being wrong is the whole setup.
+    for _flag, _val, _ok, _why in (
+            ("--workers", getattr(args, "workers", None),
+             lambda v: v >= 1, "must be at least 1"),
+            ("--retries", getattr(args, "retries", None),
+             lambda v: v >= 0, "cannot be negative"),
+            ("--timeout", getattr(args, "timeout", None),
+             lambda v: v > 0, "must be greater than 0"),
+            ("--dns-sample", getattr(args, "dns_sample", None),
+             lambda v: v >= 0, "cannot be negative")):
+        if _val is not None and not _ok(_val):
+            extra = ""
+            if _flag == "--timeout":
+                extra = (f" Values below ~{REFUSAL_LATENCY_S}s also report a "
+                         "refused port as TIMEOUT, which the summary reads "
+                         "as the opposite.")
+            sys.exit(f"ERROR: {_flag} {_val} {_why}.{extra}")
+
     if (getattr(args, "synthetic_net", None)
             and args.cmd in SYNTHETIC_NET_NOT_APPLICABLE):
         sys.exit(f"ERROR: --synthetic-net does not apply to '{args.cmd}'. The "
