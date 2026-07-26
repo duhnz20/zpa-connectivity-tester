@@ -10,6 +10,9 @@ an account, again after, then diff the two runs.
 - **Runs entirely on your own machine.** Nothing is installed or sent
   anywhere; it just calls the ZPA API and probes from your endpoint.
 
+> **[COMMANDS.md](COMMANDS.md)** — a working runbook: every command worth running,
+> in the order you would run it, with the reason each one exists.
+
 ---
 
 ## Setup
