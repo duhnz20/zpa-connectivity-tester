@@ -91,8 +91,8 @@ SEGMENTS = [
 def _handle_count():
     """Open-handle count for this process, or None.
 
-    Windows has no /proc and no /dev/fd, so a descriptor leak cannot be
-    counted the POSIX way. GetProcessHandleCount is the direct equivalent.
+    GetProcessHandleCount is how Windows reports the open-handle total for
+    a process; a leaking probe shows up as a monotonic climb.
     """
     try:
         import ctypes
@@ -155,7 +155,7 @@ def main():
                                    "zpa_segment_connectivity.py"))
     m = load(tool_path)
     print(f"\nValidating {tool_path}")
-    print(f"Python {platform.python_version()} on {platform.system()} "
+    print(f"Python {platform.python_version()} on Windows "
           f"{platform.release()}\n")
 
     # ---------------------------------------------------------------- parsing
@@ -1109,9 +1109,8 @@ def main():
           m.tcp_probe("no-such-host.invalid", 443, 1.0)[0].startswith("ERROR:"))
     check("failures carry no latency",
           m.tcp_probe("127.0.0.1", _cport, 1.0)[1] is None)
-    # Windows has no /proc or /dev/fd, so the leak is measured with the
-    # process handle count instead — GetProcessHandleCount via ctypes. A
-    # leaking tcp_probe shows up as a monotonic climb across probes.
+    # Measured with the process handle count — GetProcessHandleCount via
+    # ctypes. A leaking tcp_probe shows up as a monotonic climb.
     _hb = _handle_count()
     if _hb is not None:
         for _ in range(60):
@@ -1226,11 +1225,9 @@ def main():
             check("missing targets file exits cleanly", False,
                   "raised FileNotFoundError traceback")
 
-        # An unopenable path must exit cleanly too. Use a directory rather
-        # than chmod 0: Windows ignores POSIX mode bits for read access, so
-        # the chmod approach cannot create the condition there at all.
-        # open(<dir>) raises IsADirectoryError on POSIX and PermissionError
-        # on Windows — both OSError, both the branch under test.
+        # An unopenable path must exit cleanly too. A directory is the
+        # reliable way to create that condition: open(<dir>) raises
+        # PermissionError, which is the OSError branch under test.
         p_dir = os.path.join(_tdir, "a-directory.json")
         os.makedirs(p_dir, exist_ok=True)
         try:
@@ -1304,13 +1301,18 @@ def main():
                          act, unv, [{"status": "DNS_FAIL:x"}],
                          False, set())
     joined = " ".join(steps)
-    # Not "sudo": ipconfig /flushdns needs no elevation, so telling a
-    # Windows user to re-run elevated would send them down a dead end.
+    # ipconfig /flushdns needs no elevation, so advising an elevated
+    # re-run would send the operator down a dead end.
     check("next steps: flags a failed DNS flush before blaming DNS",
           any("flush failed" in s.lower() for s in steps),
           str(len(steps)) + " steps")
-    check("next steps: does not tell a Windows user to use sudo",
-          not any("sudo" in s for s in steps))
+    # "needs no elevation" is the correct guidance and must be allowed; what
+    # must never appear is an instruction TO elevate, which would send the
+    # operator after a prompt that does not exist for ipconfig /flushdns.
+    check("next steps: never instructs the operator to elevate",
+          not any(bad in s.lower() for s in steps
+                  for bad in ("run elevated", "as administrator",
+                              "elevated shell", "elevated prompt", "sudo")))
     check("next steps: points ip/cidr findings at the portal",
           "access logs" in joined)
     check("next steps: recommends --wildcard-probe when wildcards skipped",
@@ -1331,13 +1333,13 @@ def main():
                        "kinds": {"fqdn": 1, "ip": 0, "cidr": 0, "wildcard": 0}},
                       [], [], [{"status": "DNS_FAIL:x"}], None, {"a"}))
     check("next steps: distinguishes flush-not-attempted from flush-failed",
-          "--flush-dns" in s_none and "sudo python3" not in s_none, s_none[:60])
+          "--flush-dns" in s_none, s_none[:60])
     s_ok = " ".join(m.next_steps(Args(phase="post", wildcard_probe="www"),
                     {"entries_sampled_out": 0, "ports_truncated": 0,
                      "kinds": {"fqdn": 1, "ip": 0, "cidr": 0, "wildcard": 0}},
                     [], [], [{"status": "DNS_FAIL:x"}], True, {"a"}))
     check("next steps: clean flush + DNS failure blames enrollment, not cache",
-          "enrolled" in s_ok and "sudo" not in s_ok, s_ok[:60])
+          "enrolled" in s_ok, s_ok[:60])
 
     print("\nSaved tenants")
     _tstore = os.path.join(tempfile.mkdtemp(prefix="zpa-tenants-"),
@@ -1359,9 +1361,9 @@ def main():
              "client_secret": "s3cret"}]}
         m.save_tenant_store(doc)
         check("store round-trips", m.load_tenant_store() == doc)
-        # POSIX mode bits describe nothing on Windows; the real question is
-        # whether the ACL actually excludes other principals. This is the
-        # check that was absent, on a file that can hold a client secret.
+        # The question is whether the ACL actually excludes other
+        # principals. This is the check that was absent, on a file that can
+        # hold a client secret.
         _acl = subprocess.run(["icacls", _tstore], capture_output=True,
                               text=True).stdout
         _me = m._current_user().lower()
@@ -1766,8 +1768,8 @@ def main():
 
     print("\nProbe semantics")
     # Windows delivers ConnectionRefusedError ~2s after connect (TCP
-    # retransmit behaviour) vs instantly on Unix, so a short timeout turns
-    # REFUSED into TIMEOUT. Use a timeout above that threshold.
+    # retransmit behaviour), so a short timeout turns REFUSED into TIMEOUT.
+    # Use a timeout above that threshold.
     refuse_timeout = 5.0 if platform.system() == "Windows" else 1.0
     s, lat, att = m.tcp_probe_retry("127.0.0.1", 1, refuse_timeout, 2)
     check("REFUSED is definitive, not retried", s == "REFUSED" and att == 1,

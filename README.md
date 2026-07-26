@@ -6,8 +6,8 @@ an account, again after, then diff the two runs.
 
 - Script: `zpa_segment_connectivity.py` (v2.0.0-windows)
 - Python 3.9+, standard library only — **no `pip install`**
-- **Windows only.** It refuses to run elsewhere; for macOS use
-  [zpa-connectivity-tester-macos](https://github.com/duhnz20/zpa-connectivity-tester-macos)
+- **Windows only.** It uses `Find-NetRoute`, NRPT policy, the service
+  registry and `SetThreadExecutionState`, and refuses to run anywhere else
 - Read-only against the ZPA API (GET).
 - **Runs entirely on your own machine.** Nothing is installed or sent
   anywhere; it just calls the ZPA API and probes from your endpoint.
@@ -164,10 +164,8 @@ python3 zpa_segment_connectivity.py compare \
 ```
 
 Substitute the real filenames — `ls zpa-test-results/` shows them. Do not
-paste `<host>` literally: in bash and zsh `<` is a redirection operator, so
-a placeholder in angle brackets fails with `no such file or directory: host`
-before the tool ever runs. On macOS/Linux the shell will expand a glob for
-you:
+paste `<host>` literally — it is a placeholder for your own hostname. In
+PowerShell you can let the shell fill it in:
 
 ```
 python3 zpa_segment_connectivity.py compare \
@@ -368,7 +366,7 @@ application, database and infrastructure servers:
 |---|---|---|
 | 443 | web and application servers — most ZPA segments | negligible |
 | 80 | app servers and appliances that never got a certificate: load balancer health endpoints, Java app-server defaults, switch/storage/print consoles | negligible |
-| 22 | everything on Linux/Unix, including database and infrastructure hosts — sshd is near-universal there | moderate |
+| 22 | any host running an SSH daemon, including database and infrastructure servers | moderate |
 | 135 | Windows hosts with no web listener; the RPC endpoint mapper is on virtually every domain-joined box | **high** |
 
 The first two absorb most of an estate before either of the noisier ports is
@@ -428,15 +426,17 @@ sweep and says so.
 
 ---
 
-### Validation platforms
+### Validation
 
-| build | Linux | macOS 26.5 / Python 3.9.6 | Windows |
-|---|---|---|---|
-| macOS (`v1.10.2-macos`) | 360 pass / 8 skipped by the Darwin guard | **372 / 372** | n/a — refuses to run |
-| cross-platform (`v1.8.2`) | 344 / 344 | **344 / 344** | last exercised at v1.5.0 |
+| suite | result |
+|---|---|
+| `validate_zpa_tool.py` | **385 / 385** on Windows 11, Python 3.14.6 |
 
-macOS runs on the stock system Python 3.9.6, which is the declared floor —
-not a newer Homebrew interpreter.
+Run it yourself after unzipping — it needs no credentials and no network:
+
+```
+py -3 validate_zpa_tool.py
+```
 
 ---
 
@@ -454,7 +454,7 @@ inferred, and each is recorded in the run metadata:
 | Is split DNS in force? | **`Get-DnsClientNrptPolicy`**. ZCC drives per-domain resolution through the Name Resolution Policy Table; zero rules on an enrolled host means names are resolving via the LAN resolver |
 | Is a proxy in the path? | WinINET (per-user registry) and WinHTTP (`netsh winhttp show proxy`) |
 | Will the machine sleep mid-run? | `SetThreadExecutionState` holds a power request for the probe phase |
-| Resolver cache | `ipconfig /flushdns` — **needs no elevation**, unlike macOS |
+| Resolver cache | `ipconfig /flushdns` — **needs no elevation** |
 
 The routing check pays for itself: it runs *before* any probe, so a run can
 report "Private Access is off" instead of collecting a directory of false
@@ -471,7 +471,8 @@ Benchmarked on Windows 11 / Python 3.14.6:
 | **400 (default)** | **~1,827** |
 | 800 | ~1,888 — 3% more for double the threads |
 
-Windows has no small per-process socket cap to raise, unlike macOS.
+There is no small per-process socket cap to raise, so 400 is simply where
+the throughput curve flattens.
 
 **`--timeout` defaults to 3, and the floor matters.** Windows delivers a TCP
 connection refusal at **~2.04s**, so any value below ~2.5 reports `REFUSED`
@@ -489,8 +490,9 @@ if you go below it.
 
 The optional saved client secret is protected with a real ACL — inheritance
 stripped, granted to the current user only, then read back and verified.
-`os.chmod(0o600)` does nothing for ACLs on Windows, so a build claiming
-"mode 0600" here would be claiming something untrue.
+A file that merely inherits its parent directory's ACL is typically
+readable by SYSTEM and Administrators as well, which is not good enough for
+a file that can hold a client secret.
 
 ## Two caveats that affect how you read results
 
@@ -509,9 +511,9 @@ access logs.
 **2. Negative DNS cache can fake a post-run failure.** The pre run queries
 internal names that don't yet resolve, and those negative answers get
 cached. In the post run the same name can still return NXDOMAIN even
-though ZPA is steering it. Use `--flush-dns` on post runs (macOS needs
-sudo). If an enrolled domain still fails, restart ZCC before recording it
-as a real failure.
+though ZPA is steering it. Use `--flush-dns` on post runs — it needs no
+elevation. If an enrolled domain still fails, restart ZCC before recording
+it as a real failure.
 
 ---
 
@@ -569,13 +571,13 @@ maps per-reflector expectations. Results write to a `sipa-verify_*.csv` +
 
 | Symptom | Cause / fix |
 |---|---|
-| `cannot reach https://<vanity>.zslogin.net`, cert error | Egress is TLS-inspected. Windows Python reads the enterprise root from the cert store and usually works; macOS python.org builds ignore the System Keychain — use `--ca-bundle corp-root.pem`, or get `zslogin.net` + `api.zsapi.net` exempted from SSL inspection |
+| `cannot reach https://<vanity>.zslogin.net`, cert error | Egress is TLS-inspected. Python reads the enterprise root from the Windows certificate store and usually works; if it does not, use `--ca-bundle corp-root.pem`, or get `zslogin.net` + `api.zsapi.net` exempted from SSL inspection |
 | `HTTP 401` / `403` | Wrong vanity domain or customer ID, expired secret, or the API client lacks ZPA read scope |
 | `HTTP 429` | Rate limited — the script backs off and retries automatically (honors `Retry-After`) |
 | `ERROR: no interactive terminal` | Pass `--scope` and `--yes` explicitly for unattended runs |
 | Everything TIMEOUTs post-run | ZCC → Private Access ON and authenticated? User in the ZPA access policy? A ZCC restart is often needed after a policy change |
 | Preflight: ZCC `not_detected` | Process names vary by ZCC version — this is a hint, not proof. Verify in the ZCC UI; the authoritative signal is synthetic IPs appearing in results |
-| Windows run is slow / everything shows TIMEOUT | **Do not set `--timeout` below 3 on Windows.** Windows takes ~2s to return a connection refusal (vs instant on Linux/macOS), so a shorter timeout converts every `REFUSED` into `TIMEOUT` — which then burns retries and misreports "something answered and said no" as "nothing answered". The 5s default is safe |
+| Everything shows TIMEOUT | **Do not set `--timeout` below 3.** Windows takes ~2.04s to return a connection refusal, so a shorter timeout converts every `REFUSED` into `TIMEOUT` — which burns retries and misreports "something answered and said no" as "nothing answered". The 3s default clears it |
 
 ---
 
@@ -593,6 +595,6 @@ report           build HTML from one or two CSVs  [--out]
 Useful `test` flags: `--segment SUBSTR`, `--enabled-only`,
 `--wildcard-probe www`, `--sample-domains N`, `--cidr-hosts N`,
 `--max-ports N`, `--retries N`, `--l7`, `--l7-timeout S`, `--dns-csv [CSV]`, `--dns-ports PORTS`, `--dns-ports-all`, `--dns-sample N`, `--flush-dns`, `--report`,
-`--timeout S`, `--workers N` (keep under ~200 on macOS, FD limit 256),
+`--timeout S` (do not go below 3), `--workers N`,
 `--no-show-failures`,
 `--ca-bundle PEM`, `--yes`.

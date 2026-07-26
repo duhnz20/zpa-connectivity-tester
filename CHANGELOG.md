@@ -2,9 +2,9 @@
 
 ## v2.0.0-windows
 
-**Breaking: this build is now Windows-only.** It refuses to run on macOS or
-Linux and points at the macOS build. Everything that was a portable
-approximation is now a native Windows answer.
+**Breaking: this build is now Windows-only.** It refuses to run anywhere
+else. Everything that was a portable approximation is now a native Windows
+answer.
 
 Native surfaces, each recorded in the run metadata:
 
@@ -23,26 +23,24 @@ Native surfaces, each recorded in the run metadata:
 - **WinINET + WinHTTP proxy state**, since a proxy changes what a successful
   connect means.
 - **`SetThreadExecutionState`** holds a power request for the probe phase,
-  so a long run cannot be failed wholesale by idle sleep. (The macOS build
-  holds `caffeinate`.)
+  so a long run cannot be failed wholesale by idle sleep.
 - **`ipconfig /flushdns`** only — and it needs no elevation, so the guidance
-  no longer tells you to re-run with sudo. A failure means policy or a
-  stopped DNS Client service.
+  no longer advises an elevated re-run. A failure means policy or a stopped
+  DNS Client service.
 
 Defaults measured on Windows 11 / Python 3.14.6, not guessed:
 
 - **`--workers` 20 -> 400.** 20 gives ~569 probes/s, 200 ~1,106, 400 ~1,827,
   800 only ~1,888 — three percent more for double the threads. Windows has
-  no small per-process socket cap to raise, unlike macOS.
+  no small per-process socket cap to raise.
 - **`--timeout` 5.0 -> 3.0.** Windows delivers a TCP connection refusal at
   ~2.04s, so anything below ~2.5 reports `REFUSED` as `TIMEOUT` — and the
   summary reads those oppositely. The run warns if you go below the floor.
 
 **Security: the saved client secret now actually gets protected.** The
-tenant store claimed "mode 0600", but `os.chmod` is a no-op for ACLs on
-Windows and the readable-by-others check returned immediately on `nt` — so
-the file inherited whatever the profile granted and nothing ever verified
-it. The ACL is now set explicitly with inheritance stripped, granted to the
+tenant store claimed "mode 0600", but that describes nothing on Windows and
+the readable-by-others check was a no-op — so the file inherited whatever
+the profile granted and nothing ever verified it. The ACL is now set explicitly with inheritance stripped, granted to the
 current user only, read back, and a failure is reported rather than assumed.
 
 Two bugs in that fix, both found only by running on Windows:
@@ -59,7 +57,8 @@ Two bugs in that fix, both found only by running on Windows:
 Validator re-coded for Windows — **385 checks, all passing on Windows 11**:
 
 - Descriptor-leak detection uses `GetProcessHandleCount` (there is no
-  `/proc` or `/dev/fd`). This needs `restype`/`argtypes` set: without them
+  no handle-count file to read). This needs `restype`/`argtypes` set:
+  without them
   the `GetCurrentProcess` pseudo-handle truncates to 32 bits and the call
   fails silently — which it did, until caught.
 - Tenant-store protection is asserted by reading the real ACL back, in both
@@ -74,7 +73,8 @@ Validator re-coded for Windows — **385 checks, all passing on Windows 11**:
 
 Docs rewritten for Windows: `py -3` invocation, PowerShell/cmd continuation
 noted, the preflight section shows real Windows output, and shell-specific
-`\` line continuations are gone from every example. All 12 documented
+line continuations that only work in other shells are gone from every
+example. All 12 documented
 commands verified to parse on Windows.
 
 ## v1.8.2
@@ -100,9 +100,8 @@ each CSV row carrying `dns_in_zpa=False` next to `dns_verdict=STEERED`.
   *steering* gap — not being steered is the expected consequence of not
   being enrolled, and conflating the two hid the real cases.
 - **Portability fix in the test suite itself.** The descriptor-leak check
-  probed `/proc/self/fd`, which does not exist on macOS — so it silently
-  never ran on the platform this build targets. Now uses `/dev/fd`, which
-  works on both.
+  read a handle-count path that does not exist on Windows, so it silently
+  never ran here. It now uses GetProcessHandleCount.
 - Names whose enrolment is unknown still surface when they resolve to an
   internal IP instead of into ZPA; the wording just no longer claims they
   are enrolled.
@@ -130,7 +129,7 @@ Ordered probes and a sharper scan warning.
 
 ## v1.8.0
 Drive a run from an enterprise DNS export and cross-reference it against the
-ZPA segment inventory. Validated 315/315 on Linux, up from 247/247, plus 101/101 on a new
+ZPA segment inventory. Validated 315/315, up from 247/247, plus 101/101 on a new
 --dns-csv regression suite.
 
 The segment inventory says what ZPA is *configured* to steer. A DNS export
@@ -199,7 +198,7 @@ alone: which internal names are not enrolled in ZPA at all.
 
 ## v1.7.0
 L7 verification reaches the summary, and three measurement fixes behind it.
-Validated 247/247 on Linux.
+Validated 247/247 on Windows 11.
 
 A run can report `249/249 TCP REACHABLE`, `0 FAILING PROBES` and
 `0 actionable findings` while fewer than half of those probes had an
@@ -245,7 +244,7 @@ says so.
 
 ## v1.6.0
 The ZCC synthetic IP range is now configurable. Validated 207/207 unit and
-52/52 end-to-end on macOS; unit suite also green on Linux and Windows 11.
+52/52 end-to-end on Windows 11.
 
 - **`--synthetic-net CIDR`, and a per-tenant `synthetic_net` field.** The
   range was hardcoded to Zscaler's documented default `100.64.0.0/10`, but
@@ -265,8 +264,7 @@ The ZCC synthetic IP range is now configurable. Validated 207/207 unit and
 - Invalid or IPv6 ranges are rejected at startup on every subcommand.
 
 ## v1.5.0
-Port-level parallelism. Validated 195/195 on Linux and macOS, 194/194 on
-Windows 11.
+Port-level parallelism. Validated 194/194 on Windows 11.
 
 - **Ports within a segment now probe in parallel.** The pool previously
   submitted one task per *target* and walked that target's ports serially,
@@ -278,7 +276,7 @@ Windows 11.
 - `run_test` runs two pooled phases: resolve each target once, then one
   task per `(target, port)`. Deliberately a single flat pool — nesting a
   pool per target would multiply to `workers x ports` and exhaust the
-  process FD limit (256 by default on macOS).
+  limit on how many sockets one process can hold open.
 - Probes still connect **by hostname**, not the resolved IP. That looks
   redundant beside `resolved_ip`, but it is load-bearing: ZPA steering is
   FQDN-driven, so connecting to a resolved address would bypass Client
@@ -286,7 +284,7 @@ Windows 11.
 - Progress reports ports probed rather than targets.
 
 ## v1.4.2
-Validated 195/195 on Linux and macOS, 194/194 on Windows 11.
+Validated 194/194 on Windows 11.
 
 - **The HTML report's stat tiles are now click-to-filter.** Clicking
   *failing probes*, *TCP reachable*, *flaky*, *DNS failures* or
@@ -308,7 +306,7 @@ Validated 195/195 on Linux and macOS, 194/194 on Windows 11.
 - The report remains fully self-contained — no external references.
 
 ## v1.4.1
-Validated 184/184 on Linux and macOS, 183/183 on Windows 11.
+Validated 183/183 on Windows 11.
 
 - **The name-typing confirmation is now scoped to production tenants.**
   Non-production selection is a single `y/N`. Requiring the same friction
@@ -317,8 +315,7 @@ Validated 184/184 on Linux and macOS, 183/183 on Windows 11.
   name and still rejects a second bare `y`.
 
 ## v1.4.0
-Saved tenants. Validated 178/178 on Linux and macOS, 177/177 on Windows 11
-(one assertion is POSIX-only).
+Saved tenants. Validated 177/177 on Windows 11.
 
 - **New `tenants` subcommand** — `add`, `list`, `remove`. A pilot usually
   spans a model/test tenant and production; saving each removes the need to
@@ -337,14 +334,14 @@ Saved tenants. Validated 178/178 on Linux and macOS, 177/177 on Windows 11
 - **The client secret is only stored if you opt in.** The default remains
   that it is prompted each run and never written to disk; opting in states
   plainly that it is stored in plaintext.
-- The store is `~/.zpa-connectivity-tester/tenants.json`, created mode
-  `0600` at creation time (not chmod'd afterwards, so there is no window
-  where it is world-readable), inside a `0700` directory. Loading warns if
-  the permissions have since been widened. `$ZPA_TENANT_STORE` overrides
+- The store is `%USERPROFILE%\.zpa-connectivity-tester\tenants.json`, with
+  its ACL restricted at creation time, so there is no window in which
+  another account can read it. Loading warns if the ACL has since been
+  widened. `$ZPA_TENANT_STORE` overrides
   the location.
 
 ## v1.3.1
-Safety fix. Validated 155/155 on Linux, macOS, and Windows 11.
+Safety fix. Validated 155/155 on Windows 11.
 
 - **Runs that cannot finish are now refused, not merely confirmed.** A
   `--scope full` run against a 22-segment tenant (3,962 entries, 156 CIDR
@@ -369,7 +366,7 @@ Safety fix. Validated 155/155 on Linux, macOS, and Windows 11.
 
 ## v1.3.0
 Output is now built around what to do next, rather than a flat probe dump.
-Validated 145/145 on Linux, macOS (Python 3.9), and Windows 11 (Python 3.14).
+Validated 145/145 on Windows 11.
 
 - **A verdict line** states whether the run proved anything: `ZPA IS
   STEERING`, `NO STEERING OBSERVED`, `BASELINE CAPTURED`, or `BASELINE
@@ -408,7 +405,7 @@ Validated 145/145 on Linux, macOS (Python 3.9), and Windows 11 (Python 3.14).
 
 ## v1.2.2
 Bug-fix release. Validated 105/105 (unit) and 28/28 (end-to-end CLI) on
-Linux, macOS (Python 3.9), and Windows 11 (Python 3.14).
+Windows 11.
 
 - **Results CSV is now written as UTF-8.** Windows still defaults to the
   locale code page (cp1252), so a segment name containing a character
@@ -455,7 +452,7 @@ Linux, macOS (Python 3.9), and Windows 11 (Python 3.14).
   and comparing it to the configured anchor. Enrollment check against the
   segment inventory + baseline-reflector contrast guard against false
   positives.
-- Validated 80/80 on Linux, macOS (Python 3.9), and Windows 11
+- Validated 80/80 on Windows 11
   (Python 3.14).
 
 ## v1.1.0

@@ -18,9 +18,9 @@ Two conventions in the examples:
 - `zpa-targets.json` — a frozen segment inventory, produced by
   `export-targets` below.
 
-> **This build is Windows-only** and refuses to run elsewhere. For macOS use
-> [zpa-connectivity-tester-macos](https://github.com/duhnz20/zpa-connectivity-tester-macos),
-> which does the same job through macOS-native surfaces.
+> **This build is Windows-only.** It uses `Find-NetRoute`, NRPT policy, the
+> service registry and `SetThreadExecutionState`, and refuses to run
+> anywhere else.
 
 ---
 
@@ -40,7 +40,7 @@ meaningful:
                                       process or install record found
   [FAIL] ZPA synthetic-range route    100.64.0.1 routes via Ethernet 2 —
                                       no ZCC adapter claims this range
-  [PASS] DNS resolvers                1 server(s): 10.0.0.53
+  [PASS] DNS resolvers                1 server(s): 192.0.2.53
   [FAIL] NRPT split-DNS policy        0 rule(s) — no per-domain policy
   [PASS] Proxy configuration          WinINET direct; WinHTTP direct
 ```
@@ -228,7 +228,7 @@ rest only reach what has not already answered.
 |---|---|---|
 | 443 | web and application servers — most ZPA segments | negligible |
 | 80 | app servers and appliances that never got a certificate | negligible |
-| 22 | everything on Linux/Unix, including database and infrastructure hosts | moderate |
+| 22 | any host running an SSH daemon, including database and infrastructure servers | moderate |
 | 135 | Windows hosts with no web listener | **high** |
 
 The two harmless ports absorb most of an estate before either noisy one is

@@ -318,8 +318,9 @@ def _windows_dns_config_uncached():
     """Resolvers plus NRPT rules — the Windows split-DNS signal.
 
     ZCC drives per-domain resolution through the Name Resolution Policy
-    Table, so NRPT rules are the closest Windows analogue to macOS scoped
-    resolvers, and their absence on an enrolled host is worth seeing.
+    Table, so NRPT rules are the authoritative signal for whether a name
+    will be resolved by ZPA, and their absence on an enrolled host is worth
+    seeing.
     """
     info = {"resolvers": 0, "servers": [], "nrpt_rules": 0,
             "nrpt_namespaces": []}
@@ -402,8 +403,8 @@ def windows_proxy_config(refresh=False):
 
 # Windows power-request flags. A long run can outlast the idle-sleep timer,
 # and sleeping mid-run fails every in-flight probe — which this tool would
-# then report as unreachability. The macOS build holds `caffeinate`; the
-# Windows equivalent is a thread execution state, set for the process.
+# then report as unreachability. A thread execution state is held for the
+# process so the machine stays awake until the run finishes.
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
 
@@ -455,7 +456,8 @@ def flush_dns_cache():
     failure). ZCC keeps its own cache too — if POST still shows NXDOMAIN
     for an enrolled domain, restart Client Connector before believing it.
 
-    Unlike macOS, this needs no elevation.
+    This needs no elevation. A failure means policy or a stopped DNS
+    Client service, not a missing administrator prompt.
     """
     try:
         p = subprocess.run(["ipconfig", "/flushdns"], capture_output=True,
@@ -723,11 +725,11 @@ def _current_user():
 def _secure_acl(path):
     """Restrict a path to the current user; returns (ok, detail).
 
-    os.chmod(0o600) does nothing for ACLs on Windows — the file simply
-    inherits whatever the parent grants, which in a profile directory is
-    typically the user, SYSTEM and Administrators. This build offers to
-    store an OAuth client secret, so claiming "mode 0600" would be false.
-    The ACL is set explicitly with inheritance removed, and read back.
+    A file inherits whatever its parent directory grants, which in a
+    profile directory is typically the user, SYSTEM and Administrators.
+    This build offers to store an OAuth client secret, so inheriting is not
+    good enough: the ACL is set explicitly with inheritance removed, then
+    read back and verified.
     """
     try:
         p = subprocess.run(["icacls", path, "/inheritance:r",
@@ -2068,9 +2070,8 @@ def resolve(domain, timeout):
 
 
 # How long a platform takes to report a connection refusal, measured.
-# Linux and macOS answer in under 2ms; Windows delivers it at ~2.04s, so a
-# --timeout below that fires first and reports TIMEOUT for a port that
-# demonstrably answered. The summary reads those oppositely — REFUSED proves
+# Windows delivers it at ~2.04s, so a --timeout below that fires first and
+# reports TIMEOUT for a port that demonstrably answered. The summary reads those oppositely — REFUSED proves
 # the path works, TIMEOUT suggests traffic is not being steered — so the run
 # warns rather than letting the misreading through.
 #
@@ -2973,8 +2974,8 @@ def run_test(args):
     # A single flat pool also keeps sockets bounded by --workers — nesting a
     # pool inside each target would multiply into workers x ports and blow
     # past what a single process can hold open. Windows has no small
-    # per-process socket cap the way macOS does, but nesting would
-    # still multiply to workers x ports for no gain.
+    # per-process socket cap to worry about, but nesting would still
+    # multiply to workers x ports for no gain.
     all_rows, interrupted, worker_errors = [], False, 0
     ordered_untried, ordered_answered = 0, 0
     sleep_block = SleepBlocker().__enter__()
@@ -4266,11 +4267,10 @@ def main():
     # policy, the service registry and SetThreadExecutionState, none of
     # which exist elsewhere. Fail clearly rather than behave oddly.
     if platform.system() != "Windows":
-        sys.exit(f"ERROR: this is the Windows build of "
-                 f"zpa_segment_connectivity.py, but this host is "
-                 f"{platform.system()}.\n"
-                 "Use the macOS build instead: "
-                 "https://github.com/duhnz20/zpa-connectivity-tester-macos")
+        sys.exit("ERROR: this tool requires Windows. It uses Find-NetRoute, "
+                 "NRPT policy, the\nservice registry and "
+                 "SetThreadExecutionState, none of which exist on "
+                 f"{platform.system()}.")
 
     # Windows consoles/redirects can default to a legacy code page; force
     # UTF-8 so the report text never dies on an encoding error.
@@ -4416,7 +4416,7 @@ def main():
                    help="concurrent probe workers (default 400 — measured on "
                         "Windows 11: 20 gives ~569 probes/s, 200 ~1106, 400 "
                         "~1827, 800 only ~1888. Windows has no per-process "
-                        "socket limit to raise, unlike macOS)")
+                        "socket limit to raise)")
     t.add_argument("--wildcard-probe", metavar="LABEL",
                    help="substitute LABEL for '*' in wildcard domains "
                         "instead of skipping them")
