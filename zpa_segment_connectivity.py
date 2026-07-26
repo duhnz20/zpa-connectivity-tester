@@ -1060,8 +1060,8 @@ def save_tenant_store(doc):
         print(f"[!] Could not restrict {path}: {detail}")
         print("    Anyone who can read your profile can read this file.")
     else:
-        # The docstring used to claim the ACL was read back; it was not.
-        # Make the claim true rather than quietly dropping it.
+        # Verified, not asserted: the owner-only claim is backed by an
+        # actual read-back of the ACL.
         _warn_if_readable_by_others(path)
     return path, ok
 
@@ -1842,11 +1842,11 @@ def _csv_bool(value):
 def _dns_row_get(row, *names):
     """Case-insensitive column read; the export's casing is not guaranteed.
 
-    This used to claim case-insensitivity while doing an exact dict lookup,
-    which meant an ALL-CAPS export parsed without error and silently
-    produced NOT_STEERED_UNKNOWN for every name: RecordType, ResolvedIPs and
-    HasAnyInternalIP all read as empty, so nothing could be classified. The
-    run looked successful and every verdict was worthless.
+    Every lookup is lowercased on both sides. An exact dict lookup would
+    parse an ALL-CAPS export without error and read RecordType, ResolvedIPs
+    and HasAnyInternalIP as empty, classifying every name
+    NOT_STEERED_UNKNOWN — a run that looks successful and whose verdicts are
+    all worthless.
     """
     low = {str(k).strip().lower(): v for k, v in row.items() if k}
     for name in names:
@@ -2126,8 +2126,8 @@ def dns_verdict_for(row, ref, intercepted):
         return "STEERED"
     if ref.get("only_external") is True:
         return "NOT_STEERED_EXTERNAL"
-    # The mere presence of addresses does NOT make a name internal. Treating
-    # `ips` as a proxy for HasAnyInternalIP labelled public addresses as
+    # The mere presence of addresses does NOT make a name internal.
+    # Treating `ips` as a proxy for HasAnyInternalIP labels public addresses
     # "resolved to an internal IP", which reads as a steering gap and sends
     # the operator chasing a finding that is not there.
     if ref.get("has_internal") is True:
@@ -2493,10 +2493,10 @@ def l7_probe(host, port, timeout, sni=None):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    # One budget for the whole L7 exchange, not one per attempt. A peer that
-    # accepts and then hangs used to cost 2x l7_timeout (24s at the default
-    # --timeout 3) because the TLS read and the HTTP read each blocked a
-    # full budget on the same dead peer.
+    # One budget for the whole L7 exchange, not one per attempt: the TLS
+    # read and the HTTP read would otherwise each block a full budget on the
+    # same dead peer, so a peer that accepts and then hangs costs
+    # 2x l7_timeout (24s at the default --timeout 3).
     #
     # The outcome deliberately stays L7_ERROR rather than OPEN_NO_L7_DATA:
     # those mean different things (see L7_MEANINGS), and collapsing them
@@ -2594,11 +2594,10 @@ def target_static_rows(target, res):
 def probe_port(target, port, res, args):
     """Probe a single (target, port) — the unit of concurrency.
 
-    Splitting this out is what lets a segment's ports run in parallel.
-    Previously one pool task handled a whole target and walked its ports
-    serially, so concurrency was capped by target count: a 50-target run
-    could not go faster than 8 ports x timeout no matter how many workers
-    were configured.
+    One work unit per (target, port) is what lets a segment's ports run in
+    parallel. A unit per *target* would walk its ports serially and cap
+    concurrency at target count, so a 50-target run could not beat
+    8 ports x timeout however many workers were configured.
     """
     status, latency, attempts = tcp_probe_retry(
         target["probe_domain"], port, args.timeout, args.retries)
@@ -2639,11 +2638,10 @@ def probe_ports_ordered(target, res, args):
         try:
             row = probe_port(target, port, res, args)
         except Exception as e:
-            # Contain the failure to the port that caused it. Letting it
-            # propagate discarded every row already collected for this
-            # target and collapsed them into a single caller-side
-            # port-less PROBE_ERROR, so ports that genuinely had been
-            # probed vanished from the CSV entirely.
+            # Contain the failure to the port that caused it. Propagating
+            # it collapses the whole target into a single port-less
+            # PROBE_ERROR, so ports that were genuinely probed vanish from
+            # the CSV entirely.
             row = probe_error_row(target, e)
             row["port"] = port
             rows.append(row)
@@ -3020,8 +3018,9 @@ def group_failures(rows):
 def latency_stats(rows):
     """Percentiles over successful connects; None when nothing succeeded.
 
-    Already collected per probe and previously discarded — on a ZPA rollout
-    "is it slower now" is asked as often as "does it work".
+    Latency is already measured per probe, so summarising it costs nothing
+    — and on a ZPA rollout "is it slower now" is asked as often as "does it
+    work".
     """
     vals = []
     for r in rows:
@@ -3701,9 +3700,9 @@ def run_test(args):
     if args.show_failures:
         print(_section(f"FINDINGS ({len(action)} actionable)"))
         if not action:
-            # "behaved as expected" was previously printed on the strength of
-            # the TCP result alone, which made a run where most probes had no
-            # application response read as a clean pass.
+            # "behaved as expected" requires the L7 result, not the TCP
+            # result alone: a run where most probes had no application
+            # response would otherwise read as a clean pass.
             if interrupted:
                 print("    not established — the run was interrupted, so "
                       "'no failures' only means none were seen before it "
@@ -4122,8 +4121,8 @@ def _status_class(status):
 def _tile(n, label, cls="", filt=None):
     """A stat tile; with filt it also becomes a one-click table filter.
 
-    The counts were previously read-only, so narrowing to "just the
-    failures" meant typing into the search box and hoping the substring did
+    Each count is a control rather than a label. Narrowing to "just the
+    failures" through the search box instead means hoping the substring does
     not also match a segment name.
     """
     attr = f' data-tilefilter="{html.escape(filt)}" tabindex="0"' if filt else ""
@@ -4624,12 +4623,11 @@ SYNTHETIC_NET_NOT_APPLICABLE = ("compare", "report", "tenants")
 def add_synthetic_net_arg(p, suppress_default=False):
     """--synthetic-net, accepted both before and after the subcommand.
 
-    It was previously only defined on the subparsers, so the natural global
-    position produced 'argument cmd: invalid choice: 100.64.0.0/16' — an
-    error that never names the option the user actually typed. Defining it
-    on both parsers fixes that; the subparser copy uses SUPPRESS so that
-    omitting it after the subcommand does not overwrite a value given
-    before it.
+    Defined on the top-level parser as well as the subparsers. With a
+    subparser-only definition the natural global position yields
+    'argument cmd: invalid choice: 100.64.0.0/16', an error that never names
+    the option actually typed. The subparser copy uses SUPPRESS so omitting
+    it after the subcommand does not overwrite a value given before it.
     """
     kwargs = {"metavar": "CIDR",
               "help": "ZCC synthetic IP range for this tenant (default "
