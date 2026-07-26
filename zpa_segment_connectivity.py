@@ -1140,8 +1140,8 @@ UDP_PRIMARY_PORTS = {
 SCAN_SENSITIVE_PORTS = {
     21: "FTP", 22: "SSH", 23: "telnet", 111: "rpcbind/portmapper",
     135: "MSRPC endpoint mapper", 139: "NetBIOS session", 445: "SMB",
-    1433: "MSSQL", 3306: "MySQL", 3389: "RDP", 5432: "PostgreSQL",
-    5900: "VNC", 6379: "Redis", 27017: "MongoDB",
+    1433: "MSSQL", 1521: "Oracle TNS", 3306: "MySQL", 3389: "RDP",
+    5432: "PostgreSQL", 5900: "VNC", 6379: "Redis", 27017: "MongoDB",
 }
 
 

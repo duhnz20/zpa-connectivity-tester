@@ -311,15 +311,14 @@ For names the segments cannot supply a port for, you can name ports
 explicitly. It never overrides a segment that defines discrete ports:
 
 ```bash
---dns-csv --dns-ports 111,123,161
+--dns-csv --dns-ports 443,22,135
 ```
 
-**Check the protocol first.** Of that example set, only 111 (rpcbind) is
-normally a TCP service. 123 (NTP) and 161 (SNMP) are UDP, and this tool
-probes TCP only — so a TCP connect to them times out on a perfectly healthy,
-correctly steered host, and the summary classifies `TIMEOUT` as *"nothing
-answered, traffic may not be steered"*. That turns a protocol mismatch into
-a false ZPA finding on every host you own.
+**Check the protocol first.** This tool probes TCP only. Ports whose
+service is UDP — 123 (NTP), 161 (SNMP), 514 (syslog) — time out on a
+perfectly healthy, correctly steered host, and the summary classifies
+`TIMEOUT` as *"nothing answered, traffic may not be steered"*. That turns a
+protocol mismatch into a false ZPA finding on every host you own.
 
 The run warns about this at startup, cross-checks each port against the
 matched segment's own `udpPortRange` — direct evidence from ZPA rather than
@@ -343,7 +342,7 @@ tried in the order you give them and the walk stops at the first one that
 answers, then moves to the next destination:
 
 ```bash
---dns-csv --dns-ports 111,135,443,22
+--dns-csv --dns-ports 443,22,135
 ```
 
 On a host where 111 is open that is **one** connect, not four. Across a
@@ -351,9 +350,14 @@ whole export it is the difference between a probe and a sweep. `REFUSED`
 counts as an answer — something at the far end replied, which proves the
 path through ZPA works just as conclusively as an accepted connection.
 
-Put the port most likely to answer in your estate first. Ports never reached
-are counted and reported, so the saving is visible rather than an
-unexplained gap between planned and actual:
+**Order by hit rate, not by interest.** Whichever port is first is probed
+on 100% of destinations; the rest only reach the shrinking set that has not
+already answered. Putting a low-signature, high-hit-rate port first (443 in
+a ZPA estate, where most segments are web) means the noisier ports behind it
+are only ever tried on the minority that stayed silent.
+
+Ports never reached are counted and reported, so the saving is visible
+rather than an unexplained gap between planned and actual:
 
 ```
   -- ORDERED PROBES (stop at the first port that answers) ------
