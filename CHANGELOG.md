@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.8.1
+Ordered probes and a sharper scan warning.
+
+- **`--dns-ports` is now walked in the given order, stopping at the first
+  port that answers**, then moving to the next destination. A liveness check
+  does not need a port inventory: once one port replies the path through ZPA
+  is proven, and every further connect is pure scan volume. On a host where
+  the first port is open that is one connect instead of four. `REFUSED`
+  counts as an answer — something replied, which proves the path as
+  conclusively as an accepted connection.
+- Ports a segment actually defines are **not** ordered; there each port's
+  individual status is the point. `--dns-ports-all` opts out.
+- An `ORDERED PROBES` summary section reports destinations answered, ports
+  not tried, and connects avoided, so the saving is visible rather than an
+  unexplained gap between planned and actual.
+- **The sweep warning now names your ports.** `SCAN_SENSITIVE_PORTS` covers
+  the ports whose horizontal sweep is a standard IDS/EDR signature (21, 22,
+  23, 111, 135, 139, 445, 1433, 3306, 3389, 5432, 5900, 6379, 27017), and
+  the run names whichever of them you asked for instead of issuing a vague
+  caution. 443 is deliberately absent — an HTTPS sweep is unremarkable.
+
 ## v1.8.0
 Drive a run from an enterprise DNS export and cross-reference it against the
 ZPA segment inventory. Validated 315/315 on Linux, up from 247/247, plus 101/101 on a new

@@ -336,6 +336,38 @@ before running it.
 
 ---
 
+### Ordered probes: first answer wins
+
+`--dns-ports` is a **liveness** check, not a port inventory. The ports are
+tried in the order you give them and the walk stops at the first one that
+answers, then moves to the next destination:
+
+```bash
+--dns-csv --dns-ports 111,135,443,22
+```
+
+On a host where 111 is open that is **one** connect, not four. Across a
+whole export it is the difference between a probe and a sweep. `REFUSED`
+counts as an answer — something at the far end replied, which proves the
+path through ZPA works just as conclusively as an accepted connection.
+
+Put the port most likely to answer in your estate first. Ports never reached
+are counted and reported, so the saving is visible rather than an
+unexplained gap between planned and actual:
+
+```
+  -- ORDERED PROBES (stop at the first port that answers) ------
+    destinations answered     2380
+    ports not tried           6142   an earlier port already answered
+    connects avoided          6142   of 9388 planned (65% fewer)
+```
+
+Ports a segment actually defines are **not** ordered — there every port's
+individual status is the point. `--dns-ports-all` turns ordering off and
+probes every fallback port on every name.
+
+---
+
 ### What it finds
 
 ```
@@ -468,7 +500,7 @@ report           build HTML from one or two CSVs  [--out]
 
 Useful `test` flags: `--segment SUBSTR`, `--enabled-only`,
 `--wildcard-probe www`, `--sample-domains N`, `--cidr-hosts N`,
-`--max-ports N`, `--retries N`, `--l7`, `--l7-timeout S`, `--dns-csv [CSV]`, `--dns-ports PORTS`, `--dns-sample N`, `--flush-dns`, `--report`,
+`--max-ports N`, `--retries N`, `--l7`, `--l7-timeout S`, `--dns-csv [CSV]`, `--dns-ports PORTS`, `--dns-ports-all`, `--dns-sample N`, `--flush-dns`, `--report`,
 `--timeout S`, `--workers N` (keep under ~200 on macOS, FD limit 256),
 `--no-show-failures`,
 `--ca-bundle PEM`, `--yes`.

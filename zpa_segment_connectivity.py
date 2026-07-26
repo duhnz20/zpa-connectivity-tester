@@ -81,7 +81,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-SCRIPT_VERSION = "1.8.0"
+SCRIPT_VERSION = "1.8.1"
 DEFAULT_API_BASE = "https://api.zsapi.net"
 OAUTH_AUDIENCE = "https://api.zscaler.com"
 # Zscaler's documented default synthetic range. It is TENANT-CONFIGURABLE:
@@ -1129,6 +1129,28 @@ UDP_PRIMARY_PORTS = {
 }
 
 
+# Ports whose horizontal sweep is a standard IDS/EDR/NDR signature. Probing
+# one of these on a handful of hosts is unremarkable; probing it across an
+# entire DNS export from a single endpoint is the textbook shape of
+# reconnaissance, and it will be attributed to the account running it.
+#
+# This is not a refusal — testing your own estate is legitimate work — but
+# the run should name which of the requested ports are the noisy ones rather
+# than issue a vague caution the operator cannot act on.
+SCAN_SENSITIVE_PORTS = {
+    21: "FTP", 22: "SSH", 23: "telnet", 111: "rpcbind/portmapper",
+    135: "MSRPC endpoint mapper", 139: "NetBIOS session", 445: "SMB",
+    1433: "MSSQL", 3306: "MySQL", 3389: "RDP", 5432: "PostgreSQL",
+    5900: "VNC", 6379: "Redis", 27017: "MongoDB",
+}
+
+
+def scan_sensitive_in(ports):
+    """[(port, service)] for ports whose sweep commonly raises an alert."""
+    return [(p, SCAN_SENSITIVE_PORTS[p]) for p in ports
+            if p in SCAN_SENSITIVE_PORTS]
+
+
 def parse_dns_ports(value):
     """Parse --dns-ports, or exit with a usable message."""
     if not value:
@@ -1386,6 +1408,7 @@ def build_dns_targets(by_name, segments, args):
     stats["fallback_ports"] = list(fallback)
     stats["fallback_used"] = 0
     stats["udp_primary"] = udp_primary_in(fallback)
+    stats["scan_sensitive"] = scan_sensitive_in(fallback)
     stats["udp_confirmed"] = {}
     # Port breadth is a property of the segment, not of the name, so it is
     # measured once per segment rather than per record.
@@ -1394,11 +1417,16 @@ def build_dns_targets(by_name, segments, args):
     for name in names:
         seg_name, seg = match_segment(name, exact, wild)
         via_wild = seg is not None and name not in exact
+        # Only fallback ports are walked in order and stopped early. Ports a
+        # segment actually defines are a port inventory, and there every
+        # port's individual status is the point.
+        ordered = False
         if seg is None:
             stats["unmatched"] += 1
             ports, udp = list(fallback), []
             if ports:
                 stats["fallback_used"] += 1
+                ordered = not getattr(args, "dns_ports_all", False)
             seg_label = "(not in any ZPA segment)"
         else:
             stats["matched"] += 1
@@ -1421,6 +1449,7 @@ def build_dns_targets(by_name, segments, args):
                 if fallback:
                     ports = list(fallback)
                     stats["fallback_used"] += 1
+                    ordered = not getattr(args, "dns_ports_all", False)
                     # The segment's own UDP definition is direct evidence
                     # that a fallback port is UDP here, not a guess from a
                     # well-known-ports table.
@@ -1444,6 +1473,7 @@ def build_dns_targets(by_name, segments, args):
             "dns_ref": by_name[name],
             "dns_in_zpa": seg is not None,
             "dns_via_wildcard": via_wild,
+            "dns_ordered": ordered,
         })
     return targets, stats
 
@@ -1868,6 +1898,35 @@ def probe_port(target, port, res, args):
             "status": status, "attempts": attempts,
             "latency_ms": latency if latency is not None else "",
             "l7_result": l7}
+
+
+# A status that proves the path works. REFUSED belongs here: something at
+# the far end answered and declined, which for a liveness check is as
+# conclusive as an accepted connection.
+ANSWERED_STATUSES = ("OPEN", "OPEN_FLAKY", "REFUSED")
+
+
+def probe_ports_ordered(target, res, args):
+    """Walk this target's ports in the given order, stopping at the first
+    that answers. Returns the rows actually produced.
+
+    Fallback ports are a liveness check, not a port inventory: once one
+    answers, the path through ZPA is demonstrated and every further connect
+    is pure scan volume. On a healthy host this is one connect instead of
+    len(ports), which is the difference between a sweep and a probe when it
+    runs across a whole DNS export.
+
+    The order is the operator's — parse_dns_ports preserves input order —
+    so the most likely port for the estate can be tried first. Ports never
+    reached are counted by the caller and reported, never silently absent.
+    """
+    rows = []
+    for port in target["ports"]:
+        row = probe_port(target, port, res, args)
+        rows.append(row)
+        if str(row.get("status")) in ANSWERED_STATUSES:
+            break
+    return rows
 
 
 def probe_error_row(target, exc):
@@ -2307,6 +2366,7 @@ def run_test(args):
     args.dns_csv = getattr(args, "dns_csv", None)
     args.dns_sample = getattr(args, "dns_sample", 0)
     args.dns_ports = getattr(args, "dns_ports", None)
+    args.dns_ports_all = getattr(args, "dns_ports_all", False)
 
     # With --dns-csv and no segment source, the run is a resolution sweep:
     # it still answers which names are steered, it just has nothing to join
@@ -2398,6 +2458,10 @@ def run_test(args):
             print(f"    {dns_build['fallback_used']} name(s) given "
                   f"--dns-ports {plist} because their segment supplied no "
                   "specific port")
+            if not args.dns_ports_all:
+                print(f"        tried in that order, stopping at the first "
+                      "that answers — usually one connect per host, not "
+                      f"{len(dns_build['fallback_ports'])}")
             if dns_build["udp_primary"]:
                 names = ", ".join(f"{p}/tcp ({svc})"
                                   for p, svc in dns_build["udp_primary"])
@@ -2411,13 +2475,18 @@ def run_test(args):
                 print(f"    [!] port {p} is defined as UDP by "
                       f"{len(segs)} matched segment(s) — confirmed by ZPA, "
                       "not inferred")
+            total = (dns_build["fallback_used"]
+                     * len(dns_build["fallback_ports"]))
             print(f"    [!] {dns_build['fallback_used']} names x "
-                  f"{len(dns_build['fallback_ports'])} ports = "
-                  f"{dns_build['fallback_used'] * len(dns_build['fallback_ports'])}"
-                  " connects across the estate. Ports 111/161 in particular "
-                  "are")
-            print("        classic enumeration signatures; tell whoever "
-                  "watches IDS before running this.")
+                  f"{len(dns_build['fallback_ports'])} ports = {total} "
+                  "connects across the estate")
+            noisy = dns_build.get("scan_sensitive") or []
+            if noisy:
+                named = ", ".join(f"{p} ({svc})" for p, svc in noisy)
+                print(f"        a horizontal sweep of {named} is a standard "
+                      "IDS/EDR signature and will be")
+                print("        attributed to the account running it — tell "
+                      "whoever watches it first")
         print("    steering is settled — resolved, "
               "NOT probed (no guessed ports, no scan footprint)")
     print(f"[*] Segments matched: {stats['segments_matched']}")
@@ -2456,6 +2525,7 @@ def run_test(args):
     # pool inside each target would multiply into workers x ports and blow
     # past the process FD limit (256 by default on macOS).
     all_rows, interrupted, worker_errors = [], False, 0
+    ordered_untried, ordered_answered = 0, 0
     pool = concurrent.futures.ThreadPoolExecutor(args.workers)
     try:
         res_futs = {pool.submit(resolve_target, t, args): i
@@ -2477,24 +2547,44 @@ def run_test(args):
             all_rows.extend(target_static_rows(t, res))
             if res["dns_err"]:
                 continue
-            units.extend((t, p, res) for p in t["ports"])
+            if t.get("dns_ordered") and t["ports"]:
+                units.append((t, None, res))
+            else:
+                units.extend((t, p, res) for p in t["ports"])
 
+        def run_unit(t, p, r):
+            """Always returns a list of rows, so both shapes are uniform."""
+            if p is None:
+                return probe_ports_ordered(t, r, args)
+            return [probe_port(t, p, r, args)]
+
+        n_ordered = sum(1 for _, p, _ in units if p is None)
         print(f"    resolved {len(resolutions)}/{len(targets)} targets; "
-              f"{len(units)} port probes queued")
-        futures = {pool.submit(probe_port, t, p, r, args): t
-                   for t, p, r in units}
+              f"{len(units)} probe unit(s) queued"
+              + (f" ({n_ordered} ordered: stop at the first port that "
+                 "answers)" if n_ordered else ""))
+        futures = {pool.submit(run_unit, t, p, r): t for t, p, r in units}
         done, step = 0, max(25, (len(futures) // 20) or 25)
         for fut in concurrent.futures.as_completed(futures):
+            t = futures[fut]
             try:
-                all_rows.append(fut.result())
+                rows = fut.result()
+                all_rows.extend(rows)
+                if t.get("dns_ordered"):
+                    # What the early stop saved, counted here rather than
+                    # left as an unexplained gap between planned and actual.
+                    ordered_untried += max(0, len(t["ports"]) - len(rows))
+                    if rows and str(rows[-1].get("status")) in \
+                            ANSWERED_STATUSES:
+                        ordered_answered += 1
             except Exception as e:
                 # One bad unit must not discard a long run's results; record
                 # it as a row so it is visible in the CSV, not a traceback.
                 worker_errors += 1
-                all_rows.append(probe_error_row(futures[fut], e))
+                all_rows.append(probe_error_row(t, e))
             done += 1
             if done % step == 0 or done == len(futures):
-                print(f"    probed {done}/{len(futures)} ports")
+                print(f"    probed {done}/{len(futures)} unit(s)")
     except KeyboardInterrupt:
         # long full-scope runs are worth salvaging — keep partial results
         interrupted = True
@@ -2597,7 +2687,9 @@ def run_test(args):
                                    {kk: sorted(vv) for kk, vv in v.items()}
                                    if k == "udp_confirmed" else v)
                                for k, v in dns_build.items()},
-                     "crossref": dstats}),
+                     "crossref": dstats,
+                     "ordered_probe": {"answered": ordered_answered,
+                                       "ports_not_tried": ordered_untried}}),
         "slowest_segments": [{"segment": s, "median_ms": m, "probes": n}
                              for s, m, n in slowest_segments(all_rows)],
 
@@ -2632,6 +2724,18 @@ def run_test(args):
     print(_section("COVERAGE"))
     for line in coverage_report(stats, args, len(tcp_rows)):
         print(line)
+
+    if ordered_answered or ordered_untried:
+        planned = ordered_untried + sum(
+            1 for r in all_rows if r.get("protocol") == "tcp")
+        print(_section("ORDERED PROBES (stop at the first port that answers)"))
+        print(f"    destinations answered  {ordered_answered:>7}")
+        print(f"    ports not tried        {ordered_untried:>7}  "
+              "an earlier port in the order already answered")
+        print(f"    connects avoided       {ordered_untried:>7}  "
+              f"of {planned} planned"
+              + (f" ({100.0 * ordered_untried / planned:.0f}% fewer)"
+                 if planned else ""))
 
     if dstats:
         print(_section("DNS CROSS-REFERENCE (export vs endpoint)"))
@@ -3802,6 +3906,11 @@ def main():
                         "on a healthy host. Probing a fixed set across a "
                         "whole DNS export is a horizontal scan — notify "
                         "whoever watches IDS first")
+    t.add_argument("--dns-ports-all", action="store_true",
+                   help="[--dns-csv] probe every --dns-ports port on every "
+                        "name instead of stopping at the first that answers. "
+                        "Turns a liveness check into a port inventory and "
+                        "multiplies the connect count accordingly")
     t.add_argument("--dns-sample", type=int, default=0, metavar="N",
                    help="cap the DNS export at N names (default 0 = every "
                         "record). --scope does not thin this list: sampling "

@@ -61,6 +61,7 @@ class Args:
             customer_id=None, api_base="https://api.zsapi.net",
             targets_file=None, retries=0, l7=False, l7_timeout=None,
             dns_csv=None, dns_sample=0, dns_ports=None,
+            dns_ports_all=False,
             flush_dns=False,
             report=False, microtenant_id=None)
         defaults.update(kw)
@@ -481,6 +482,76 @@ def main():
         except AttributeError as _e:
             check("summary helpers tolerate a namespace without the new "
                   "flags", False, str(_e))
+
+        # Ordered probing: fallback ports are a liveness check, so the walk
+        # stops at the first port that answers. On a healthy host that is
+        # one connect instead of len(--dns-ports), which is the difference
+        # between a probe and a sweep across a whole export.
+        check("scan-sensitive ports are named, 443 is not",
+              m.scan_sensitive_in([111, 135, 443, 22])
+              == [(111, "rpcbind/portmapper"),
+                  (135, "MSRPC endpoint mapper"), (22, "SSH")],
+              str(m.scan_sensitive_in([111, 135, 443, 22])))
+        check("REFUSED counts as an answer — the path is proven",
+              "REFUSED" in m.ANSWERED_STATUSES)
+        _ot = {"segment": "S", "enabled": True, "ip_anchored": False,
+               "kind": "fqdn", "domain": "d", "probe_domain": "h.corp.local",
+               "ports": [111, 135, 443, 22]}
+        _ores = {"ip": "100.64.1.1", "intercepted": True, "sni": None,
+                 "dns_err": None}
+        _real_pp = m.probe_port
+
+        def _scripted(by_port):
+            tried = []
+
+            def fake(target, port, res, args):
+                tried.append(port)
+                return {**m.target_base(target), "resolved_ip": res["ip"],
+                        "zpa_intercepted": res["intercepted"],
+                        "protocol": "tcp", "port": port,
+                        "status": by_port.get(port, "TIMEOUT"),
+                        "attempts": 1, "latency_ms": "", "l7_result": ""}
+            return fake, tried
+
+        try:
+            _f, _tr = _scripted({443: "OPEN"})
+            m.probe_port = _f
+            _rows = m.probe_ports_ordered(_ot, _ores, Args())
+            check("the walk stops at the first port that answers",
+                  _tr == [111, 135, 443] and len(_rows) == 3, str(_tr))
+            check("ports after the answer are never connected",
+                  22 not in _tr)
+            _f, _tr = _scripted({111: "OPEN"})
+            m.probe_port = _f
+            check("an answer on the first port costs one connect",
+                  len(m.probe_ports_ordered(_ot, _ores, Args())) == 1
+                  and _tr == [111], str(_tr))
+            _f, _tr = _scripted({135: "REFUSED"})
+            m.probe_port = _f
+            m.probe_ports_ordered(_ot, _ores, Args())
+            check("REFUSED stops the walk", _tr == [111, 135], str(_tr))
+            _f, _tr = _scripted({})
+            m.probe_port = _f
+            check("a destination that never answers tries every port",
+                  len(m.probe_ports_ordered(_ot, _ores, Args())) == 4)
+        finally:
+            m.probe_port = _real_pp
+
+        _oa = Args(dns_csv=_dcsv, dns_sample=0, dns_ports="111,135,443,22")
+        _otg, _obs = m.build_dns_targets(_dby, _dsegs, _oa)
+        _obn = {t["probe_domain"]: t for t in _otg}
+        check("--dns-ports order is preserved, not sorted",
+              _obn["orphan.corp.local"]["ports"] == [111, 135, 443, 22],
+              str(_obn["orphan.corp.local"]["ports"]))
+        check("fallback targets are marked for ordered probing",
+              _obn["orphan.corp.local"]["dns_ordered"] is True)
+        check("segment-derived ports are a port inventory, not ordered",
+              _obn["in-seg.corp.local"]["dns_ordered"] is False)
+        check("--dns-ports-all turns ordering off",
+              m.build_dns_targets(_dby, _dsegs,
+                                  Args(dns_csv=_dcsv, dns_ports="111,443",
+                                       dns_ports_all=True))[0][0]
+              ["dns_ordered"] is False)
 
         check("steered verdict",
               m.dns_verdict_for({"status": "OPEN"}, _dby["in-seg.corp.local"],
