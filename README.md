@@ -311,7 +311,7 @@ For names the segments cannot supply a port for, you can name ports
 explicitly. It never overrides a segment that defines discrete ports:
 
 ```bash
---dns-csv --dns-ports 443,22,135
+--dns-csv --dns-ports 443,80,22,135
 ```
 
 **Check the protocol first.** This tool probes TCP only. Ports whose
@@ -342,10 +342,10 @@ tried in the order you give them and the walk stops at the first one that
 answers, then moves to the next destination:
 
 ```bash
---dns-csv --dns-ports 443,22,135
+--dns-csv --dns-ports 443,80,22,135
 ```
 
-On a host where 111 is open that is **one** connect, not four. Across a
+On a host that answers on 443 that is **one** connect, not four. Across a
 whole export it is the difference between a probe and a sweep. `REFUSED`
 counts as an answer — something at the far end replied, which proves the
 path through ZPA works just as conclusively as an accepted connection.
@@ -355,6 +355,25 @@ on 100% of destinations; the rest only reach the shrinking set that has not
 already answered. Putting a low-signature, high-hit-rate port first (443 in
 a ZPA estate, where most segments are web) means the noisier ports behind it
 are only ever tried on the minority that stayed silent.
+
+`443,80,22,135` is a reasonable default for a mixed estate of web,
+application, database and infrastructure servers:
+
+| port | catches | sweep signature |
+|---|---|---|
+| 443 | web and application servers — most ZPA segments | negligible |
+| 80 | app servers and appliances that never got a certificate: load balancer health endpoints, Java app-server defaults, switch/storage/print consoles | negligible |
+| 22 | everything on Linux/Unix, including database and infrastructure hosts — sshd is near-universal there | moderate |
+| 135 | Windows hosts with no web listener; the RPC endpoint mapper is on virtually every domain-joined box | **high** |
+
+The first two absorb most of an estate before either of the noisier ports is
+reached. Database ports (1433, 1521, 3306, 5432) are deliberately absent: a
+database host almost always answers on 22 or 135 anyway, so they add
+signature risk without adding liveness coverage. Substituting 445 (SMB) or
+3389 (RDP) for 135 is a bad trade — both are more universal and both carry
+considerably worse signatures. If your Windows fleet is managed over WinRM,
+**5985** is the one genuine improvement on 135: comparable coverage, and
+being HTTP-based it does not read as RPC enumeration.
 
 Ports never reached are counted and reported, so the saving is visible
 rather than an unexplained gap between planned and actual:
