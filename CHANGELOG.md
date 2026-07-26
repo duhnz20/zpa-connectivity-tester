@@ -22,6 +22,10 @@ each CSV row carrying `dns_in_zpa=False` next to `dns_verdict=STEERED`.
 - A name known absent from every segment is no longer counted as a
   *steering* gap — not being steered is the expected consequence of not
   being enrolled, and conflating the two hid the real cases.
+- **Portability fix in the test suite itself.** The descriptor-leak check
+  probed `/proc/self/fd`, which does not exist on macOS — so it silently
+  never ran on the platform this build targets. Now uses `/dev/fd`, which
+  works on both.
 - Names whose enrolment is unknown still surface when they resolve to an
   internal IP instead of into ZPA; the wording just no longer claims they
   are enrolled.

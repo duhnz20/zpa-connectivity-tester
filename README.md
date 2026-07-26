@@ -426,6 +426,18 @@ sweep and says so.
 
 ---
 
+### Validation platforms
+
+| build | Linux | macOS 26.5 / Python 3.9.6 | Windows |
+|---|---|---|---|
+| macOS (`v1.10.2-macos`) | 360 pass / 8 skipped by the Darwin guard | **372 / 372** | n/a — refuses to run |
+| cross-platform (`v1.8.2`) | 344 / 344 | **344 / 344** | last exercised at v1.5.0 |
+
+macOS runs on the stock system Python 3.9.6, which is the declared floor —
+not a newer Homebrew interpreter.
+
+---
+
 ## Two caveats that affect how you read results
 
 Both follow from how Client Connector implements ZPA steering, and both

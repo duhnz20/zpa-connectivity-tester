@@ -923,15 +923,18 @@ def main():
           m.tcp_probe("no-such-host.invalid", 443, 1.0)[0].startswith("ERROR:"))
     check("failures carry no latency",
           m.tcp_probe("127.0.0.1", _cport, 1.0)[1] is None)
-    if os.path.isdir("/proc/self/fd"):
+    # /dev/fd works on macOS and Linux alike; /proc/self/fd is Linux-only,
+    # so this check silently never ran on the platform the macOS build
+    # targets.
+    if os.path.isdir("/dev/fd"):
         time.sleep(0.2)
-        _b = len(os.listdir("/proc/self/fd"))
+        _b = len(os.listdir("/dev/fd"))
         for _ in range(40):
             m.tcp_probe("127.0.0.1", _lport, 1.0)
         time.sleep(0.2)
         check("no descriptor leak across 40 probes",
-              len(os.listdir("/proc/self/fd")) - _b <= 2,
-              f"{_b} -> {len(os.listdir('/proc/self/fd'))}")
+              len(os.listdir("/dev/fd")) - _b <= 2,
+              f"{_b} -> {len(os.listdir('/dev/fd'))}")
     _srv.close()
 
     # ------------------------------------------------------------ probe layer
