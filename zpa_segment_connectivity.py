@@ -793,7 +793,7 @@ def preflight_checks(args, need_api=True, need_targets_file=None):
 
     # Resolve what the tool actually depends on, not an arbitrary public
     # name. A single hardcoded probe host is a false-failure trap: DNS
-    # filtering (homelab blocklists, ZIA policy) commonly NXDOMAINs
+    # filtering (DNS blocklists, ZIA policy) commonly NXDOMAINs
     # well-known resolver hostnames, which says nothing about whether DNS
     # works. Any one success is enough.
     socket.setdefaulttimeout(5)
@@ -2299,8 +2299,9 @@ def estimate_duration(n_probes, args):
 def confirm_run(n_probes, args):
     best, worst = estimate_duration(n_probes, args)
 
-    # A full-scope run against a real tenant can plan hundreds of billions of
-    # probes — 156 CIDRs expanded to every host, times a 1-65535 port range.
+    # A full-scope run against a large tenant can plan hundreds of billions
+    # of probes — every CIDR expanded to every host, times a 1-65535 port
+    # range.
     # Confirming that is not enough: it cannot finish, and what it emits is an
     # enormous port sweep against the App Connectors. Deliberately NOT
     # bypassed by --yes, because --yes means "unattended", not "unbounded".
@@ -2668,7 +2669,7 @@ ACTION_LIST_CAP = 25
 def triage_failures(rows):
     """Split failing rows into (action_required, unverifiable_here).
 
-    A flat failure list buries the findings that matter: on a real tenant the
+    A flat failure list buries the findings that matter: at scale the
     IP/CIDR timeouts vastly outnumber the FQDN failures, and only the latter
     are actionable from the endpoint.
     """
@@ -4369,7 +4370,7 @@ def extract_ip(text):
 
     Handles plain-text bodies (api.ipify.org, checkip.amazonaws.com) and
     JSON shapes ({"ip":...} / {"origin":...} / {"query":...}). IPv4 only —
-    SIPA anchors are IPv4 and this homelab/tenant context is IPv4-only.
+    SIPA anchors are IPv4, and this tool is scoped to IPv4 accordingly.
     """
     if not text:
         return None

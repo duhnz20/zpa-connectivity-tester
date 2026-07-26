@@ -1132,10 +1132,10 @@ def main():
                                        dns_ports_all=True))[0][0]
               ["dns_ordered"] is False)
 
-        # Regression for a real-run bug: with no --targets-file the tool
+        # Regression for a reported bug: with no --targets-file the tool
         # recorded dns_in_zpa=False for every name, so a run whose own
-        # verdict said "ZPA IS STEERING 1421 domains" simultaneously
-        # reported 1458 names as an enrolment gap. False means "checked and
+        # verdict said "ZPA IS STEERING <N> domains" could simultaneously
+        # report <M> names as an enrolment gap. False means "checked and
         # absent"; not-checked has to be a third state.
         _ntg, _nbs = m.build_dns_targets(_dby, [], _da)
         check("no inventory -> enrolment_checked is False",
@@ -1986,12 +1986,12 @@ def main():
           "synthetic_net" in m.TENANT_FIELDS)
 
     print("\nRun-size safety ceiling")
-    # Real numbers from a --scope full run against a 22-segment tenant:
-    # 6,958,550 targets / ~456 billion probes. The tool merely *asked* for
-    # confirmation, and the run could never have finished.
-    HUGE = 456_009_725_001
+    # A --scope full run against a large tenant can plan an impossible
+    # number of probes. Prompting for confirmation is not enough at that
+    # size — a run like this could never have finished.
+    HUGE = 456_000_000_000
     best, worst = m.estimate_duration(HUGE, Args(workers=20, timeout=5.0))
-    check("worst case for a real full-scope run is measured in years",
+    check("worst case for a full-scope run is measured in years",
           worst / 31_536_000 > 1000, m.format_duration(worst))
     check("even the best case is impractical",
           best / 86_400 > 100, m.format_duration(best))

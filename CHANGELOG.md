@@ -183,10 +183,11 @@ commands verified to parse on Windows.
 Fixes a false finding that contradicted the run's own verdict.
 
 A `--dns-csv` run without a segment source reported every name as an
-enrolment gap — including the ones ZPA was demonstrably steering. On a real
-export that read as `ZPA IS STEERING — 1421 domains` in the verdict and
-`ENROLMENT GAP (1458) — in no ZPA segment at all` twenty lines below it, with
-each CSV row carrying `dns_in_zpa=False` next to `dns_verdict=STEERED`.
+enrolment gap — including the ones ZPA was demonstrably steering. On any
+export large enough to show it, the verdict reads `ZPA IS STEERING — <N>
+domains` while `ENROLMENT GAP (<M>) — in no ZPA segment at all` appears
+twenty lines below it, with each CSV row carrying `dns_in_zpa=False` next to
+`dns_verdict=STEERED`.
 
 - **`dns_in_zpa` is now tri-state.** `False` means checked and absent; `""`
   means never checked, which is what an absent segment inventory actually
@@ -446,10 +447,10 @@ Saved tenants. Validated 177/177 on Windows 11.
 Safety fix. Validated 155/155 on Windows 11.
 
 - **Runs that cannot finish are now refused, not merely confirmed.** A
-  `--scope full` run against a 22-segment tenant (3,962 entries, 156 CIDR
-  entries expanded to every usable host, against full port ranges) planned
-  ~456 billion probes — roughly 3,615 years at 20 workers, and still about
-  4 years if every probe answered instantly. The tool printed the count and
+  `--scope full` run against a large tenant (a few thousand entries, with
+  CIDR entries expanded to every usable host, against full port ranges) can
+  plan hundreds of billions of probes — millennia at 20 workers, and still
+  years even if every probe answered instantly. The tool printed the count and
   asked for confirmation, but a number that large does not read as
   impossible. It now estimates wall-clock duration and exits above a
   12-hour worst case, listing the flags that narrow the run
