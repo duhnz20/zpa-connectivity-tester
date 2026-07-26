@@ -6,9 +6,10 @@ understand produces a result you cannot defend.
 
 Run everything from the folder containing `zpa_segment_connectivity.py`.
 
-**Invocation.** Examples use `python3`. On Windows use `python` (or `py -3`),
-and note that PowerShell continues lines with a backtick `` ` `` rather than
-a backslash `\` — or just put each command on one line.
+**Invocation.** Examples use `py -3`, the Python launcher. In **PowerShell**
+line continuation is a backtick `` ` ``; in **cmd.exe** it is a caret `^`.
+The examples below are written on one line where practical to avoid the
+difference entirely.
 
 Two conventions in the examples:
 
@@ -17,28 +18,46 @@ Two conventions in the examples:
 - `zpa-targets.json` — a frozen segment inventory, produced by
   `export-targets` below.
 
-> There is also a macOS-only build,
+> **This build is Windows-only** and refuses to run elsewhere. For macOS use
 > [zpa-connectivity-tester-macos](https://github.com/duhnz20/zpa-connectivity-tester-macos),
-> with native ZCC and routing-table detection, sleep suppression during long
-> runs, and defaults tuned for Apple silicon. This build runs everywhere.
+> which does the same job through macOS-native surfaces.
 
 ---
 
 ## 0. Before anything: does this host make sense to test from?
 
 ```bash
-python3 zpa_segment_connectivity.py preflight --synthetic-net 100.64.0.0/16
+py -3 zpa_segment_connectivity.py preflight --synthetic-net 100.64.0.0/16
 ```
 
-**Why.** Ten seconds here saves a run you have to throw away. It checks the
-Python version, whether the output folder is writable, whether Client
-Connector appears to be running, DNS reachability — and it states the
-synthetic range it will judge against.
+**Why.** Ten seconds here saves a run you have to throw away. It asks
+Windows directly for everything that determines whether the run is even
+meaningful:
 
-Read the ZCC line carefully: detection is by process name, and those names
-differ between ZCC releases, so a negative result is reported as **unknown**
-rather than "not running". It is a hint, not a verdict. The authoritative
-signal is the synthetic-IP evidence gathered during probing.
+```
+  [PASS] ZPA synthetic range          100.64.0.0/16 (65,536 addresses)
+  [FAIL] Zscaler Client Connector     not_detected — no Zscaler service,
+                                      process or install record found
+  [FAIL] ZPA synthetic-range route    100.64.0.1 routes via Ethernet 2 —
+                                      no ZCC adapter claims this range
+  [PASS] DNS resolvers                1 server(s): 10.0.0.53
+  [FAIL] NRPT split-DNS policy        0 rule(s) — no per-domain policy
+  [PASS] Proxy configuration          WinINET direct; WinHTTP direct
+```
+
+**The routing line is the one to read first.** It uses `Find-NetRoute` to
+ask what the stack would actually do with a packet to the synthetic range.
+If no ZCC adapter claims it, Private Access is off or unauthenticated — and
+every result you were about to collect would have been a false negative.
+
+**The NRPT line is the Windows-specific one.** ZCC implements split DNS
+through the Name Resolution Policy Table. Zero rules on a host that should
+be enrolled means names are being resolved by the LAN resolver, not by ZPA,
+whatever the client's tray icon says.
+
+ZCC detection distinguishes **installed but not running** from **not
+detected**, because the remedy differs: start the service, versus install
+the client.
 
 Add `--tenant NAME` once you have saved one, to check credentials too.
 
@@ -49,8 +68,8 @@ Add `--tenant NAME` once you have saved one, to check credentials too.
 ### Save a tenant
 
 ```bash
-python3 zpa_segment_connectivity.py tenants add model
-python3 zpa_segment_connectivity.py tenants list
+py -3 zpa_segment_connectivity.py tenants add model
+py -3 zpa_segment_connectivity.py tenants list
 ```
 
 **Why.** A pilot usually spans a model and a production tenant, and retyping
@@ -59,16 +78,15 @@ believing you are on the model tenant. Saved tenants make the choice explicit
 and confirm it twice — the second confirmation for a production tenant
 requires typing its name.
 
-The store is `~/.zpa-connectivity-tester/tenants.json` (`%USERPROFILE%` on
-Windows), mode `0600` where the OS supports it. **The client secret is only
+The store is `%USERPROFILE%\.zpa-connectivity-tester\tenants.json`, with its ACL
+restricted to your account (inheritance stripped) and verified after write. **The client secret is only
 written if you opt in**; by default it is prompted each run and never touches
 disk. Override the location with `$ZPA_TENANT_STORE`.
 
 ### Freeze the inventory
 
 ```bash
-python3 zpa_segment_connectivity.py export-targets \
-    --tenant model --out zpa-targets.json
+py -3 zpa_segment_connectivity.py export-targets  --tenant model --out zpa-targets.json
 ```
 
 **Why.** Three reasons, in order of how much they will bite you:
@@ -90,9 +108,7 @@ that way.
 ### Baseline, before ZPA is enabled for the account
 
 ```bash
-python3 zpa_segment_connectivity.py test --phase pre \
-    --scope sample --targets-file zpa-targets.json \
-    --synthetic-net 100.64.0.0/16 --report
+py -3 zpa_segment_connectivity.py test --phase pre  --scope sample --targets-file zpa-targets.json  --synthetic-net 100.64.0.0/16 --report
 ```
 
 **Why.** Without a baseline you cannot distinguish "ZPA broke this" from
@@ -103,24 +119,18 @@ because you have captured a post-state and labelled it "pre".
 ### After ZPA is enabled
 
 ```bash
-python3 zpa_segment_connectivity.py test --phase post \
-    --scope sample --targets-file zpa-targets.json \
-    --synthetic-net 100.64.0.0/16 --l7 --flush-dns --report
+py -3 zpa_segment_connectivity.py test --phase post  --scope sample --targets-file zpa-targets.json  --synthetic-net 100.64.0.0/16 --l7 --flush-dns --report
 ```
 
 **Why `--flush-dns`.** A negative DNS answer cached during the pre run — when
 the name genuinely did not resolve — survives into the post run and masks
-steering that is now working. The flush is platform-specific and so are its
-privileges:
+steering that is now working. On Windows this runs `ipconfig /flushdns`,
+which **needs no elevation**. If it fails, the cause is policy or a stopped
+DNS Client service, not a missing admin prompt — so do not go hunting for an
+elevated shell.
 
-| platform | command run | needs |
-|---|---|---|
-| Windows | `ipconfig /flushdns` | usually nothing; an elevated shell if it fails |
-| macOS | `dscacheutil -flushcache` + `killall -HUP mDNSResponder` | **`sudo`** |
-| Linux | `resolvectl flush-caches` | systemd-resolved present |
-
-The run reports honestly whether the flush actually succeeded and warns you
-if it did not — do not infer success from the absence of an error.
+The run reports honestly whether the flush actually succeeded; do not infer
+success from the absence of an error.
 
 ZCC keeps its own cache too. If an enrolled domain still shows `DNS_FAIL`
 after a clean flush, restart Client Connector before believing it.
@@ -131,9 +141,7 @@ pass](#3-verifying-specific-claims). Use it on every post run.
 ### Diff them
 
 ```bash
-python3 zpa_segment_connectivity.py compare \
-    zpa-test-results/pre_sample_HOST_TIMESTAMP.csv \
-    zpa-test-results/post_sample_HOST_TIMESTAMP.csv --html change-report.html
+py -3 zpa_segment_connectivity.py compare  zpa-test-results/pre_sample_HOST_TIMESTAMP.csv  zpa-test-results/post_sample_HOST_TIMESTAMP.csv --html change-report.html
 ```
 
 **Why.** This is the deliverable. It separates regressions (worked before,
@@ -147,9 +155,7 @@ number for "did the rollout do what it was supposed to."
 ### Is an application actually serving, or did ZPA just accept the connection?
 
 ```bash
-python3 zpa_segment_connectivity.py test --phase post \
-    --targets-file zpa-targets.json --synthetic-net 100.64.0.0/16 \
-    --l7 --l7-timeout 15 --report
+py -3 zpa_segment_connectivity.py test --phase post  --targets-file zpa-targets.json --synthetic-net 100.64.0.0/16  --l7 --l7-timeout 15 --report
 ```
 
 **Why.** Through ZPA the TCP connection is accepted **locally by Client
@@ -170,9 +176,8 @@ as:
 | `L7_ERROR:…` | the exchange failed; raise `--l7-timeout` before believing it |
 
 **Why `--l7-timeout`.** The L7 step has its own budget: 4x `--timeout`,
-clamped to 5–15s. At this build's default `--timeout 5` that already lands at
-the 15s ceiling, so the flag matters most when you have *lowered* `--timeout`
-for speed. A ZPA connect completes locally and fast; a TLS handshake has to
+clamped to 5–15s. At this build's default `--timeout 3` that resolves to 12s,
+so the flag matters most when you have *lowered* `--timeout`. A ZPA connect completes locally and fast; a TLS handshake has to
 traverse the App Connector to the backend, so sharing one budget reports
 working applications as L7 timeouts. Raise it explicitly to prove a finding is
 real: if the failures do not move, the silence is genuine.
@@ -180,11 +185,7 @@ real: if the failures do not move, the silence is genuine.
 ### Is Source IP Anchoring actually anchoring?
 
 ```bash
-python3 zpa_segment_connectivity.py sipa-verify \
-    --targets-file zpa-targets.json \
-    --reflector https://ipcheck.internal.example/ip \
-    --expected-anchor 198.51.100.0/24 \
-    --baseline-reflector https://api.ipify.org
+py -3 zpa_segment_connectivity.py sipa-verify  --targets-file zpa-targets.json  --reflector https://ipcheck.internal.example/ip  --expected-anchor 198.51.100.0/24  --baseline-reflector https://api.ipify.org
 ```
 
 **Why.** A TCP connect cannot prove SIPA. Only the source IP the destination
@@ -202,9 +203,7 @@ off-network.
 ## 4. Coverage: what exists that ZPA does not cover?
 
 ```bash
-python3 zpa_segment_connectivity.py test --phase post \
-    --targets-file zpa-targets.json --synthetic-net 100.64.0.0/16 \
-    --dns-csv --dns-ports 443,80,22,135 --report
+py -3 zpa_segment_connectivity.py test --phase post  --targets-file zpa-targets.json --synthetic-net 100.64.0.0/16  --dns-csv --dns-ports 443,80,22,135 --report
 ```
 
 Put `dns_destinations.csv` beside the script; bare `--dns-csv` finds it.
@@ -258,15 +257,12 @@ or not a single connect is made. `--dns-ports` is optional.
 ### A domain fails that should work
 
 ```bash
-python3 zpa_segment_connectivity.py test --phase post \
-    --targets-file zpa-targets.json --synthetic-net 100.64.0.0/16 \
-    --segment "Segment Name" --flush-dns --l7 --report
+py -3 zpa_segment_connectivity.py test --phase post  --targets-file zpa-targets.json --synthetic-net 100.64.0.0/16  --segment "Segment Name" --flush-dns --l7 --report
 ```
 
 **Why.** Narrow to one segment, flush the cache, and check L7. In that order:
 most "failures" are a stale negative cache entry or an application that was
-never listening, not ZPA. On macOS prefix this with `sudo` so the flush can
-actually run.
+never listening, not ZPA. No elevation is needed for the flush on Windows.
 
 ### Wildcard entries were skipped
 
@@ -282,22 +278,22 @@ many were skipped so it is never silent.
 ### The run is too slow, or too aggressive
 
 ```bash
---workers 200      # default is 20; raise it, watch the platform limits
---timeout 2        # lower on a fast, low-latency path
+--workers 400      # the measured sweet spot; see below
+--timeout 3        # do not go below ~2.5 — see below
 --sample-domains N --cidr-hosts N --max-ports N
 --scope full       # exhaustive; see the warning below
 ```
 
-**Why the default is conservative.** 20 workers is safe everywhere. Runtime
-here is almost entirely network I/O, so raising `--workers` is the single
-biggest speed lever — but the ceiling is platform-dependent:
+**Why 400.** Measured on Windows 11 / Python 3.14.6, not guessed: 20 workers
+gives ~569 probes/s, 200 ~1,106, 400 ~1,827, and 800 only ~1,888 — three
+percent more for double the threads. Windows has no small per-process socket
+cap to raise, so there is nothing to tune around; 400 is simply where the
+curve flattens.
 
-- **macOS** ships a soft file-descriptor limit of 256, so keep this build
-  under ~200 or you will see spurious probe errors rather than a clear
-  resource message. (The macOS build raises the limit itself and defaults
-  to 800.)
-- **Linux** typically allows far more; raise `ulimit -n` to match.
-- **Windows** has no comparable FD limit for sockets.
+**Why `--timeout 3` and not lower.** Windows delivers a TCP connection
+refusal at ~2.04s. Below ~2.5 a refused port reports `TIMEOUT` instead of
+`REFUSED`, and the summary reads those oppositely — a refusal proves the
+path works. The run warns if you set it below the threshold.
 
 **Before `--scope full`:** a full-scope run against wide CIDRs and full port
 ranges is a port sweep and can plan billions of probes. The tool refuses runs
@@ -313,30 +309,29 @@ Three files land in `zpa-test-results/` per run: the CSV (every probe), a
 `--report` a self-contained HTML page whose tiles are clickable filters.
 
 ```bash
-python3 zpa_segment_connectivity.py report --out report.html \
-    zpa-test-results/pre_sample_HOST_TIMESTAMP.csv \
-    zpa-test-results/post_sample_HOST_TIMESTAMP.csv
+py -3 zpa_segment_connectivity.py report --out report.html  zpa-test-results/pre_sample_HOST_TIMESTAMP.csv  zpa-test-results/post_sample_HOST_TIMESTAMP.csv
 ```
 
-Useful one-liners over the newest results CSV (POSIX shells; on Windows run
-the same Python from a script file, since `cmd.exe` quoting will fight you):
+Useful one-liners over the newest results CSV. `cmd.exe` and PowerShell
+both fight multi-line `python -c` quoting, so save each as a `.py` file and
+run `py -3 <file>.py` — the bodies below are the file contents:
 
 ```bash
 # What did L7 actually find? The number that matters most.
-python3 -c "
+py -3 -c "
 import csv,collections,glob
 r=list(csv.DictReader(open(sorted(glob.glob('zpa-test-results/post_*.csv'))[-1])))
 print(collections.Counter(x['l7_result'] for x in r if x['status'].startswith('OPEN')))"
 
 # Which names are in DNS but in no ZPA segment? The enrolment gap.
-python3 -c "
+py -3 -c "
 import csv,glob
 r=list(csv.DictReader(open(sorted(glob.glob('zpa-test-results/post_*.csv'))[-1])))
 print('\n'.join(sorted({x['probe_domain'] for x in r
       if x.get('dns_in_zpa')=='False' and x.get('dns_has_internal')=='True'})))"
 
 # Everything that failed, grouped by status
-python3 -c "
+py -3 -c "
 import csv,collections,glob
 r=list(csv.DictReader(open(sorted(glob.glob('zpa-test-results/post_*.csv'))[-1])))
 print(collections.Counter(x['status'].split(':')[0] for x in r))"
@@ -386,8 +381,11 @@ force and flags when it is still the default.
    summary groups them separately as UNVERIFIABLE HERE. Confirm those in the
    ZPA admin portal's access logs.
 2. **A cached negative DNS answer can fake a post-run failure.** Use
-   `--flush-dns`; if an enrolled domain still fails afterwards, restart
-   Client Connector before treating it as real.
+   `--flush-dns` (no elevation needed); if an enrolled domain still fails
+   afterwards, restart Client Connector before treating it as real.
+3. **`REFUSED` and `TIMEOUT` are not interchangeable on Windows.** A refusal
+   takes ~2.04s to arrive, so a `--timeout` below ~2.5 turns "the path works,
+   nothing is listening" into "nothing answered". Keep the default.
 
 ---
 

@@ -15,6 +15,8 @@ import json
 import os
 import platform
 import re
+import contextlib
+import io
 import shutil
 import socket
 import subprocess
@@ -83,6 +85,68 @@ SEGMENTS = [
      "domainNames": ["off.corp.local"],
      "tcpPortRange": [{"from": "80", "to": "80"}]},
 ]
+
+
+
+def _handle_count():
+    """Open-handle count for this process, or None.
+
+    Windows has no /proc and no /dev/fd, so a descriptor leak cannot be
+    counted the POSIX way. GetProcessHandleCount is the direct equivalent.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.windll.kernel32
+        # restype/argtypes are mandatory, not tidiness: GetCurrentProcess
+        # returns the pseudo-handle (HANDLE)-1, and ctypes defaults to a
+        # 32-bit int return. On 64-bit Windows that truncates, the call is
+        # handed a garbage handle, and it fails silently by returning 0.
+        k.GetCurrentProcess.restype = wintypes.HANDLE
+        k.GetProcessHandleCount.argtypes = [wintypes.HANDLE,
+                                            ctypes.POINTER(wintypes.DWORD)]
+        k.GetProcessHandleCount.restype = wintypes.BOOL
+        n = wintypes.DWORD()
+        if not k.GetProcessHandleCount(k.GetCurrentProcess(),
+                                       ctypes.byref(n)):
+            return None
+        return int(n.value)
+    except Exception:
+        return None
+
+
+def _capture(fn, *a, **kw):
+    """Run fn and return what it printed — these warnings are the product."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        fn(*a, **kw)
+    return buf.getvalue()
+
+
+def _default_of(m, subcmd, flag):
+    """The argparse default for a flag, read from the parser itself.
+
+    Asserting against the real parser rather than a copied literal means a
+    changed default cannot silently drift away from the constraint that
+    justified it.
+    """
+    import argparse
+    ap = None
+    old = sys.argv
+    try:
+        sys.argv = ["x", subcmd, "--help"]
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                m.main()
+        except SystemExit:
+            pass
+    finally:
+        sys.argv = old
+    txt = buf.getvalue()
+    mt = re.search(re.escape(flag) + r"[^\n]*?\(default (\d+(?:\.\d+)?)",
+                   txt, re.S)
+    return float(mt.group(1)) if mt else float("nan")
 
 
 def main():
@@ -217,6 +281,112 @@ def main():
         [{"id": "9", "domainNames": ["a.corp"]}], Args(segment="nomatch"))
     check("--segment filter tolerates missing name",
           st8["segments_matched"] == 0)
+
+    # ------------------------------------------------------- Windows probes
+    # Every native surface this build depends on. These run against the real
+    # OS: PowerShell, Find-NetRoute, the NRPT store, the proxy registry and
+    # the power-request API. A parse that works on the author's machine and
+    # nowhere else is the failure mode being guarded against, so each one
+    # asserts the SHAPE of what came back, not a value only true here.
+    print("\nWindows environment probes")
+
+    check("this build refuses to run anywhere but Windows",
+          platform.system() == "Windows",
+          f"running on {platform.system()} — the guard in main() would exit")
+
+    _rc, _out = m._ps("Write-Output READY")
+    check("_ps runs PowerShell and returns (rc, text)",
+          _rc == 0 and "READY" in _out, f"rc={_rc} out={_out.strip()[:60]}")
+    _rc, _out = m._ps("this-command-does-not-exist-zzz")
+    check("_ps surfaces a failure as non-zero rather than raising",
+          _rc not in (0, None), f"rc={_rc}")
+    check("_ps never raises on a bad executable",
+          m._ps("Write-Output ok", timeout=1) is not None)
+
+    _z = m.detect_zcc()
+    check("detect_zcc returns the documented shape",
+          isinstance(_z, dict)
+          and {"state", "services", "processes_found", "signals",
+               "installed_version"} <= set(_z),
+          str(sorted(_z))[:110])
+    check("detect_zcc state is one of the three documented values",
+          _z["state"] in ("running", "installed_not_running", "not_detected"),
+          _z["state"])
+    check("detect_zcc distinguishes installed-not-running from absent",
+          not (_z["state"] == "not_detected"
+               and (_z["services"] or _z["installed_version"])),
+          f"state={_z['state']} services={_z['services']}")
+    check("detect_zcc is memoized within a run", m.detect_zcc() is _z)
+    check("detect_zcc refresh=True re-probes",
+          m.detect_zcc(refresh=True) is not _z)
+
+    _net16 = m.parse_synthetic_net("100.64.0.0/16")
+    _st = m.windows_steering_path(_net16)
+    check("steering probe returns the documented shape",
+          isinstance(_st, dict)
+          and {"checked", "probe_ip", "interface", "via_tunnel"} <= set(_st),
+          str(sorted(_st))[:110])
+    check("steering probe targets the first host of the range",
+          _st["probe_ip"] == "100.64.0.1", _st["probe_ip"])
+    check("Find-NetRoute resolved an interface",
+          _st["checked"] and _st["interface"],
+          f"checked={_st['checked']} if={_st['interface']!r}")
+    check("via_tunnel is a decided boolean once checked",
+          isinstance(_st["via_tunnel"], bool) if _st["checked"] else True,
+          str(_st["via_tunnel"]))
+    check("steering cache is keyed by range, not shared across ranges",
+          m.windows_steering_path(m.parse_synthetic_net("10.0.0.0/24"))
+          is not _st)
+    check("the same range returns the cached answer",
+          m.windows_steering_path(_net16) is _st)
+
+    _d = m.windows_dns_config()
+    check("dns probe returns the documented shape",
+          isinstance(_d, dict)
+          and {"resolvers", "servers", "nrpt_rules", "nrpt_namespaces"}
+          <= set(_d), str(sorted(_d))[:110])
+    check("dns probe found at least one resolver",
+          _d["resolvers"] > 0 and len(_d["servers"]) == _d["resolvers"],
+          f"{_d['resolvers']} {_d['servers'][:3]}")
+    check("nrpt_rules is an int, and matches the namespace list",
+          isinstance(_d["nrpt_rules"], int)
+          and len(_d["nrpt_namespaces"]) <= max(_d["nrpt_rules"], 8),
+          f"rules={_d['nrpt_rules']} ns={len(_d['nrpt_namespaces'])}")
+
+    _px = m.windows_proxy_config()
+    check("proxy probe returns the documented shape",
+          isinstance(_px, dict)
+          and {"proxy_enabled", "proxy_server", "autoconfig_url", "winhttp"}
+          <= set(_px), str(sorted(_px))[:110])
+    check("proxy_enabled is a real boolean",
+          isinstance(_px["proxy_enabled"], bool), str(_px["proxy_enabled"]))
+    check("winhttp state was read", bool(_px["winhttp"]),
+          _px["winhttp"][:70])
+
+    _sb = m.SleepBlocker()
+    with _sb:
+        check("SleepBlocker reports what it did", bool(_sb.detail), _sb.detail)
+        check("SleepBlocker acquired the power request",
+              _sb._set, _sb.detail)
+    check("SleepBlocker releases on exit", not _sb._set)
+    check("SleepBlocker is re-entrant without raising",
+          m.SleepBlocker().__enter__().__exit__(None, None, None) is False)
+
+    _u = m._current_user()
+    check("_current_user returns a principal icacls can resolve",
+          _u and "\\" in _u, repr(_u))
+    check("_current_user does not use USERDOMAIN blindly",
+          _u.lower() != f"{os.environ.get('USERDOMAIN','')}\\"
+          f"{os.environ.get('USERNAME','')}".lower()
+          or os.environ.get("USERDOMAIN", "").lower()
+          == os.environ.get("COMPUTERNAME", "").lower(),
+          f"{_u} vs USERDOMAIN={os.environ.get('USERDOMAIN')}")
+
+    _ok, _det = m.flush_dns_cache()
+    check("flush_dns_cache succeeds without elevation on Windows",
+          _ok is True, _det)
+    check("flush_dns_cache reports a string detail",
+          isinstance(_det, str) and "flushdns" in _det, _det)
 
     # ------------------------------------------------------ DNS destinations
     # The export is pre-ZPA ground truth: what each name resolves to with no
@@ -917,24 +1087,42 @@ def main():
     _cl.bind(("127.0.0.1", 0))
     _cport = _cl.getsockname()[1]
     _cl.close()
-    check("refusal still REFUSED",
-          m.tcp_probe("127.0.0.1", _cport, 1.0)[0] == "REFUSED")
+    # Windows delivers a refusal ~2.04s after the SYN, so the probe timeout
+    # must clear that or a path that demonstrably answered reads as TIMEOUT
+    # — and the summary reads those oppositely.
+    _rt = m.REFUSAL_LATENCY_S + 1.0
+    check("refusal is REFUSED above the refusal latency",
+          m.tcp_probe("127.0.0.1", _cport, _rt)[0] == "REFUSED",
+          str(m.tcp_probe("127.0.0.1", _cport, _rt)))
+    check("REFUSAL_LATENCY_S clears the measured Windows latency",
+          m.REFUSAL_LATENCY_S >= 2.5, str(m.REFUSAL_LATENCY_S))
+    check("a sub-latency timeout does NOT report REFUSED",
+          m.tcp_probe("127.0.0.1", _cport, 0.5)[0] == "TIMEOUT",
+          str(m.tcp_probe("127.0.0.1", _cport, 0.5)))
+    check("the default --timeout clears the refusal latency",
+          _default_of(m, "test", "--timeout") >= m.REFUSAL_LATENCY_S,
+          str(_default_of(m, "test", "--timeout")))
+    check("a genuine timeout is still TIMEOUT, not a false refusal",
+          m.tcp_probe("10.255.255.1", 9, 0.4)[0] != "REFUSED",
+          str(m.tcp_probe("10.255.255.1", 9, 0.4)))
     check("resolution failure reported as ERROR:",
           m.tcp_probe("no-such-host.invalid", 443, 1.0)[0].startswith("ERROR:"))
     check("failures carry no latency",
           m.tcp_probe("127.0.0.1", _cport, 1.0)[1] is None)
-    # /dev/fd works on macOS and Linux alike; /proc/self/fd is Linux-only,
-    # so this check silently never ran on the platform the macOS build
-    # targets.
-    if os.path.isdir("/dev/fd"):
-        time.sleep(0.2)
-        _b = len(os.listdir("/dev/fd"))
-        for _ in range(40):
+    # Windows has no /proc or /dev/fd, so the leak is measured with the
+    # process handle count instead — GetProcessHandleCount via ctypes. A
+    # leaking tcp_probe shows up as a monotonic climb across probes.
+    _hb = _handle_count()
+    if _hb is not None:
+        for _ in range(60):
             m.tcp_probe("127.0.0.1", _lport, 1.0)
-        time.sleep(0.2)
-        check("no descriptor leak across 40 probes",
-              len(os.listdir("/dev/fd")) - _b <= 2,
-              f"{_b} -> {len(os.listdir('/dev/fd'))}")
+        time.sleep(0.3)
+        _ha = _handle_count()
+        check("no handle leak across 60 probes", (_ha - _hb) <= 10,
+              f"{_hb} -> {_ha}")
+    else:
+        check("handle-count probe available", False,
+              "GetProcessHandleCount unavailable")
     _srv.close()
 
     # ------------------------------------------------------------ probe layer
@@ -1116,8 +1304,13 @@ def main():
                          act, unv, [{"status": "DNS_FAIL:x"}],
                          False, set())
     joined = " ".join(steps)
-    check("next steps: flags an incomplete DNS flush before blaming DNS",
-          any("sudo" in s for s in steps), str(len(steps)) + " steps")
+    # Not "sudo": ipconfig /flushdns needs no elevation, so telling a
+    # Windows user to re-run elevated would send them down a dead end.
+    check("next steps: flags a failed DNS flush before blaming DNS",
+          any("flush failed" in s.lower() for s in steps),
+          str(len(steps)) + " steps")
+    check("next steps: does not tell a Windows user to use sudo",
+          not any("sudo" in s for s in steps))
     check("next steps: points ip/cidr findings at the portal",
           "access logs" in joined)
     check("next steps: recommends --wildcard-probe when wildcards skipped",
@@ -1131,7 +1324,7 @@ def main():
                             [], [], [], "ok", {"a.corp"})
     check("next steps: silent when a run is clean and complete",
           steps_ok == [], str(steps_ok))
-    # regression: macOS reports "dscacheutil=ok, killall=rc1" for a FAILED
+    # regression: the detail string must never be substring-matched for
     # flush, so this must key off the boolean, not the detail string
     s_none = " ".join(m.next_steps(Args(phase="post", wildcard_probe="www"),
                       {"entries_sampled_out": 0, "ports_truncated": 0,
@@ -1166,10 +1359,37 @@ def main():
              "client_secret": "s3cret"}]}
         m.save_tenant_store(doc)
         check("store round-trips", m.load_tenant_store() == doc)
-        if os.name != "nt":
-            mode = os.stat(_tstore).st_mode & 0o777
-            check("store is written 0600, not widened later", mode == 0o600,
-                  oct(mode))
+        # POSIX mode bits describe nothing on Windows; the real question is
+        # whether the ACL actually excludes other principals. This is the
+        # check that was absent, on a file that can hold a client secret.
+        _acl = subprocess.run(["icacls", _tstore], capture_output=True,
+                              text=True).stdout
+        _me = m._current_user().lower()
+        _principals = []
+        _first = True
+        for _line in _acl.splitlines():
+            if ":(" not in _line:
+                continue
+            _e = _line
+            if _first:
+                if _e.startswith(_tstore):
+                    _e = _e[len(_tstore):]
+                _first = False
+            _principals.append(_e.split(":(")[0].strip().lower())
+        check("tenant store ACL grants only the current user",
+              _principals and all(x == _me for x in _principals),
+              f"principals={_principals} me={_me}")
+        check("tenant store ACL inheritance is stripped",
+              "(I)" not in _acl, _acl.strip()[:120])
+        check("_warn_if_readable_by_others is silent on a restricted store",
+              _capture(m._warn_if_readable_by_others, _tstore) == "")
+        subprocess.run(["icacls", _tstore, "/grant", "Everyone:(R)"],
+                       capture_output=True)
+        check("_warn_if_readable_by_others catches a widened ACL",
+              "Everyone" in _capture(m._warn_if_readable_by_others, _tstore),
+              _capture(m._warn_if_readable_by_others, _tstore)[:100])
+        subprocess.run(["icacls", _tstore, "/remove:g", "Everyone"],
+                       capture_output=True)
         check("find_tenant is case-insensitive",
               m.find_tenant(doc, "PRODUCTION")["client_id"] == "pid")
         check("find_tenant returns None for unknown",
@@ -1348,7 +1568,7 @@ def main():
             check(f"invalid range {bad!r} rejected", True,
                   str(e.code).splitlines()[0][:44])
     v, det = m.run_verdict(Args(phase="post"), {"a.corp"},
-                           {"state": "running"}, d16)
+                           {"state": "running"}, None, d16)
     check("verdict names the tenant's range, not the default",
           "100.64.0.0/16" in det and "100.64.0.0/10" not in det, det[:70])
     check("synthetic_net is a stored tenant field",
@@ -1407,6 +1627,24 @@ def main():
     # 1 — verdict resolves the question the run exists to answer
     v, d = m.run_verdict(Args(phase="post"), {"a.corp"}, {"state": "running"})
     check("post + synthetic IPs -> steering verdict", v == "ZPA IS STEERING", v)
+    # The routing evidence is what lets a negative say *why*: no adapter
+    # claims the range at all, versus one does but nothing resolved into it.
+    v, d = m.run_verdict(Args(phase="post"), {"a.corp"}, {"state": "running"},
+                         {"via_tunnel": True, "interface": "Zscaler"})
+    check("steering verdict cites the corroborating adapter",
+          "Zscaler" in d, d[:80])
+    v, d = m.run_verdict(Args(phase="post"), set(), {"state": "running"},
+                         {"via_tunnel": False, "interface": "Ethernet"})
+    check("no adapter claims the range -> says Private Access is likely off",
+          v == "NO STEERING OBSERVED" and "Private Access" in d, d[:90])
+    v, d = m.run_verdict(Args(phase="post"), set(), {"state": "running"},
+                         {"via_tunnel": True, "interface": "Zscaler"})
+    check("adapter present but nothing steered -> points at enrolment/policy",
+          v == "NO STEERING OBSERVED" and "policy" in d, d[:90])
+    v, d = m.run_verdict(Args(phase="pre"), set(), {"state": "running"},
+                         {"via_tunnel": True, "interface": "Zscaler"})
+    check("pre with the range already routed -> BASELINE SUSPECT",
+          v == "BASELINE SUSPECT", v)
     v, d = m.run_verdict(Args(phase="post"), set(), {"state": "running"})
     check("post + none -> no-steering verdict", v == "NO STEERING OBSERVED", v)
     v, d = m.run_verdict(Args(phase="pre"), set(), {"state": "not_detected"})

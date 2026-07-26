@@ -1,5 +1,82 @@
 # Changelog
 
+## v2.0.0-windows
+
+**Breaking: this build is now Windows-only.** It refuses to run on macOS or
+Linux and points at the macOS build. Everything that was a portable
+approximation is now a native Windows answer.
+
+Native surfaces, each recorded in the run metadata:
+
+- **`Find-NetRoute`** against the first host of the synthetic range — the
+  `route -n get` equivalent. It resolves what the stack would actually do
+  with a packet to that address, *before* any probe runs, so a run can
+  report "Private Access is off" instead of collecting a directory of false
+  negatives and calling them failures.
+- **ZCC state from services + processes + the uninstall registry**, so
+  *installed but not running* is distinct from *not detected* — the remedies
+  differ (start the service, versus install the client).
+- **`Get-DnsClientNrptPolicy`** as the split-DNS signal. ZCC drives
+  per-domain resolution through the Name Resolution Policy Table; zero rules
+  on an enrolled host means names are resolving via the LAN resolver
+  whatever the tray icon says. There is no portable equivalent of this.
+- **WinINET + WinHTTP proxy state**, since a proxy changes what a successful
+  connect means.
+- **`SetThreadExecutionState`** holds a power request for the probe phase,
+  so a long run cannot be failed wholesale by idle sleep. (The macOS build
+  holds `caffeinate`.)
+- **`ipconfig /flushdns`** only — and it needs no elevation, so the guidance
+  no longer tells you to re-run with sudo. A failure means policy or a
+  stopped DNS Client service.
+
+Defaults measured on Windows 11 / Python 3.14.6, not guessed:
+
+- **`--workers` 20 -> 400.** 20 gives ~569 probes/s, 200 ~1,106, 400 ~1,827,
+  800 only ~1,888 — three percent more for double the threads. Windows has
+  no small per-process socket cap to raise, unlike macOS.
+- **`--timeout` 5.0 -> 3.0.** Windows delivers a TCP connection refusal at
+  ~2.04s, so anything below ~2.5 reports `REFUSED` as `TIMEOUT` — and the
+  summary reads those oppositely. The run warns if you go below the floor.
+
+**Security: the saved client secret now actually gets protected.** The
+tenant store claimed "mode 0600", but `os.chmod` is a no-op for ACLs on
+Windows and the readable-by-others check returned immediately on `nt` — so
+the file inherited whatever the profile granted and nothing ever verified
+it. The ACL is now set explicitly with inheritance stripped, granted to the
+current user only, read back, and a failure is reported rather than assumed.
+
+Two bugs in that fix, both found only by running on Windows:
+
+- `_current_user` built `%USERDOMAIN%\%USERNAME%`, but on a machine that is
+  not domain-joined that is `WORKGROUP\user` while the real principal is
+  `COMPUTERNAME\user`. `icacls` rejected it with rc1332, "no mapping
+  between account names and security IDs". It now asks `whoami`, which
+  reports the form `icacls` accepts.
+- The ACL parser split each line on `:` and captured the drive letter `C` as
+  a principal, so it matched nothing real and missed a deliberate
+  `Everyone:(R)` grant. It now splits on the ACE marker `:(`.
+
+Validator re-coded for Windows — **385 checks, all passing on Windows 11**:
+
+- Descriptor-leak detection uses `GetProcessHandleCount` (there is no
+  `/proc` or `/dev/fd`). This needs `restype`/`argtypes` set: without them
+  the `GetCurrentProcess` pseudo-handle truncates to 32 bits and the call
+  fails silently — which it did, until caught.
+- Tenant-store protection is asserted by reading the real ACL back, in both
+  directions: silent when restricted, and catching a deliberately widened
+  grant.
+- Every native probe is covered for *shape*, not for values only true on one
+  machine: `_ps`, `Find-NetRoute` parsing and its range-keyed cache, NRPT,
+  proxy, `SleepBlocker` acquire/release, and `_current_user`.
+- The verdict is exercised across all four routing-evidence combinations.
+- The `--timeout` default is asserted against the parser itself, so it
+  cannot drift below the refusal latency that justified it.
+
+Docs rewritten for Windows: `py -3` invocation, PowerShell/cmd continuation
+noted, the preflight section shows real Windows output, and shell-specific
+`\` line continuations are gone from every example. All 12 documented
+commands verified to parse on Windows.
+
 ## v1.8.2
 Fixes a false finding that contradicted the run's own verdict.
 

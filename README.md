@@ -1,12 +1,14 @@
-# ZPA Application Segment Connectivity Test
+# ZPA Application Segment Connectivity Test — Windows build
 
 Admin tool for validating reachability to ZPA application segments from an
 endpoint running Zscaler Client Connector. Run it before ZPA is enabled for
 an account, again after, then diff the two runs.
 
-- Script: `zpa_segment_connectivity.py` (v1.8.2)
+- Script: `zpa_segment_connectivity.py` (v2.0.0-windows)
 - Python 3.9+, standard library only — **no `pip install`**
-- Windows / macOS / Linux. Read-only against the ZPA API (GET).
+- **Windows only.** It refuses to run elsewhere; for macOS use
+  [zpa-connectivity-tester-macos](https://github.com/duhnz20/zpa-connectivity-tester-macos)
+- Read-only against the ZPA API (GET).
 - **Runs entirely on your own machine.** Nothing is installed or sent
   anywhere; it just calls the ZPA API and probes from your endpoint.
 
@@ -17,8 +19,8 @@ an account, again after, then diff the two runs.
 
 ## Setup
 
-**Python** — Windows: Microsoft Store install (per-user, no admin), then
-use `py -3`. macOS: `xcode-select --install`, then `python3`.
+**Python** — Microsoft Store install (per-user, no admin) or
+`winget install --id Python.Python.3.13 --scope user`, then use `py -3`.
 
 **Credentials** — you do **not** need to set anything up. Just run the tool
 and it will **prompt you** for the four OneAPI values your ZPA administrator
@@ -437,6 +439,58 @@ macOS runs on the stock system Python 3.9.6, which is the declared floor —
 not a newer Homebrew interpreter.
 
 ---
+
+---
+
+## What this build uses that a portable one cannot
+
+Every environment answer comes from Windows directly rather than being
+inferred, and each is recorded in the run metadata:
+
+| question | how it is answered |
+|---|---|
+| Does a path into the synthetic range exist? | `Find-NetRoute` — the `route -n get` equivalent. Resolves what the stack would actually do with a packet to that address |
+| Is Client Connector present, and running? | services + processes + the uninstall registry, so **installed-but-stopped** is distinct from **absent** — the remedies differ |
+| Is split DNS in force? | **`Get-DnsClientNrptPolicy`**. ZCC drives per-domain resolution through the Name Resolution Policy Table; zero rules on an enrolled host means names are resolving via the LAN resolver |
+| Is a proxy in the path? | WinINET (per-user registry) and WinHTTP (`netsh winhttp show proxy`) |
+| Will the machine sleep mid-run? | `SetThreadExecutionState` holds a power request for the probe phase |
+| Resolver cache | `ipconfig /flushdns` — **needs no elevation**, unlike macOS |
+
+The routing check pays for itself: it runs *before* any probe, so a run can
+report "Private Access is off" instead of collecting a directory of false
+negatives and calling them failures.
+
+### Defaults are measured, not guessed
+
+Benchmarked on Windows 11 / Python 3.14.6:
+
+| `--workers` | throughput |
+|---|---|
+| 20 | ~569 probes/s |
+| 200 | ~1,106 |
+| **400 (default)** | **~1,827** |
+| 800 | ~1,888 — 3% more for double the threads |
+
+Windows has no small per-process socket cap to raise, unlike macOS.
+
+**`--timeout` defaults to 3, and the floor matters.** Windows delivers a TCP
+connection refusal at **~2.04s**, so any value below ~2.5 reports `REFUSED`
+as `TIMEOUT` — and the summary reads those oppositely: a refusal proves the
+path works, a timeout suggests traffic is not being steered. The run warns
+if you go below it.
+
+| `--timeout` | closed port reports |
+|---|---|
+| 0.5 | `TIMEOUT` after 512ms |
+| 2.0 | `TIMEOUT` after 2016ms |
+| **3.0** | **`REFUSED` after 2041ms** |
+
+### Credential storage
+
+The optional saved client secret is protected with a real ACL — inheritance
+stripped, granted to the current user only, then read back and verified.
+`os.chmod(0o600)` does nothing for ACLs on Windows, so a build claiming
+"mode 0600" here would be claiming something untrue.
 
 ## Two caveats that affect how you read results
 
