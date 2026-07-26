@@ -93,7 +93,7 @@ except (ImportError, ValueError):
     wintypes = None
 from datetime import datetime, timezone
 
-SCRIPT_VERSION = "2.1.0-windows"
+SCRIPT_VERSION = "2.1.1-windows"
 DEFAULT_API_BASE = "https://api.zsapi.net"
 OAUTH_AUDIENCE = "https://api.zscaler.com"
 # Zscaler's documented default synthetic range. It is TENANT-CONFIGURABLE:
@@ -2126,7 +2126,11 @@ def dns_verdict_for(row, ref, intercepted):
         return "STEERED"
     if ref.get("only_external") is True:
         return "NOT_STEERED_EXTERNAL"
-    if ref.get("has_internal") is True or ref.get("ips"):
+    # The mere presence of addresses does NOT make a name internal. Treating
+    # `ips` as a proxy for HasAnyInternalIP labelled public addresses as
+    # "resolved to an internal IP", which reads as a steering gap and sends
+    # the operator chasing a finding that is not there.
+    if ref.get("has_internal") is True:
         return "NOT_STEERED_INTERNAL"
     return "NOT_STEERED_UNKNOWN"
 
@@ -2394,7 +2398,13 @@ def tcp_probe(host, port, timeout):
         return "ERROR:no address returned", None
 
     af, socktype, proto, _canon, sockaddr = infos[0]
-    sock = socket.socket(af, socktype, proto)
+    try:
+        sock = socket.socket(af, socktype, proto)
+    except OSError as e:
+        # Descriptor exhaustion is a local resource problem, not a statement
+        # about the path. Reported as a probe status so it lands on a real
+        # tcp row instead of escaping as a port-less PROBE_ERROR.
+        return f"ERROR:{e.strerror or e}", None
     try:
         sock.settimeout(timeout)
         start = time.monotonic()
@@ -2449,9 +2459,13 @@ def l7_timeout_for(args):
         return cached
     raw = getattr(args, "l7_timeout", None)
     if raw is not None:
-        if raw <= 0:
-            sys.exit("ERROR: --l7-timeout must be greater than 0.")
-        val = float(raw)
+        # Deliberately NOT sys.exit. This runs inside a pool worker via
+        # probe_port, and SystemExit derives from BaseException, so it slips
+        # past the `except Exception` in the pool handler, propagates out of
+        # fut.result(), and destroys an entire run's collected results. The
+        # value is validated at parse time; this clamp is the belt to that
+        # braces and must never raise from a thread.
+        val = float(raw) if raw > 0 else L7_TIMEOUT_FLOOR
     else:
         val = min(L7_TIMEOUT_CEILING,
                   max(L7_TIMEOUT_FLOOR,
@@ -2622,7 +2636,18 @@ def probe_ports_ordered(target, res, args):
     """
     rows = []
     for port in target["ports"]:
-        row = probe_port(target, port, res, args)
+        try:
+            row = probe_port(target, port, res, args)
+        except Exception as e:
+            # Contain the failure to the port that caused it. Letting it
+            # propagate discarded every row already collected for this
+            # target and collapsed them into a single caller-side
+            # port-less PROBE_ERROR, so ports that genuinely had been
+            # probed vanished from the CSV entirely.
+            row = probe_error_row(target, e)
+            row["port"] = port
+            rows.append(row)
+            continue
         rows.append(row)
         if str(row.get("status")) in ANSWERED_STATUSES:
             break
@@ -2630,8 +2655,22 @@ def probe_ports_ordered(target, res, args):
 
 
 def probe_error_row(target, exc):
-    """A failed work unit, recorded rather than lost to a traceback."""
-    return {**target_base(target), "resolved_ip": "", "zpa_intercepted": "",
+    """A failed work unit, recorded rather than lost to a traceback.
+
+    This is the last line of defence, so it reads the target defensively.
+    target_base subscripts directly — correct for the normal path, where a
+    missing key is a bug worth surfacing — but raising *here* would defeat
+    the containment this row exists to provide and lose the unit anyway.
+    """
+    try:
+        base = target_base(target)
+    except Exception:
+        base = {k: (target.get(k, "") if isinstance(target, dict) else "")
+                for k in ("segment", "enabled", "ip_anchored", "domain",
+                          "probe_domain")}
+        base["entry_kind"] = (target.get("kind", "")
+                              if isinstance(target, dict) else "")
+    return {**base, "resolved_ip": "", "zpa_intercepted": "",
             "protocol": "", "port": "",
             "status": f"PROBE_ERROR:{type(exc).__name__}",
             "attempts": 0, "latency_ms": "", "l7_result": ""}
@@ -3521,6 +3560,15 @@ def run_test(args):
           f"({args.scope_resolved} scope, {host}, {ts}) ===")
     print(f"  VERDICT   {verdict_label}")
     print(f"            {verdict_detail}")
+    if interrupted:
+        # Ctrl-C stops probing wherever it happened to be. Absence of
+        # evidence past that point is not evidence of absence, so the
+        # verdict above is reported as provisional rather than as a finding.
+        print("  [!] THIS RUN WAS INTERRUPTED — the verdict above rests on "
+              "the probes that")
+        print("      completed, not on the planned set. Anything not reached "
+              "is unknown, not")
+        print("      negative. Re-run to completion before acting on it.")
     hist = status_histogram(all_rows)
     order = [s for s in ("OPEN", "OPEN_FLAKY") if s in hist] + sorted(
         (s for s in hist if s not in ("OPEN", "OPEN_FLAKY")),
@@ -3656,7 +3704,11 @@ def run_test(args):
             # "behaved as expected" was previously printed on the strength of
             # the TCP result alone, which made a run where most probes had no
             # application response read as a clean pass.
-            if l7s and l7s["unverified"]:
+            if interrupted:
+                print("    not established — the run was interrupted, so "
+                      "'no failures' only means none were seen before it "
+                      "stopped")
+            elif l7s and l7s["unverified"]:
                 print("    no TCP-level failures, but "
                       f"{l7s['unverified']} of {l7s['probed']} OPEN probes "
                       "had no application response — see L7 VERIFICATION")
@@ -4886,7 +4938,17 @@ def main():
             ("--timeout", getattr(args, "timeout", None),
              lambda v: v > 0, "must be greater than 0"),
             ("--dns-sample", getattr(args, "dns_sample", None),
-             lambda v: v >= 0, "cannot be negative")):
+             lambda v: v >= 0, "cannot be negative"),
+            # --l7-timeout is resolved inside a worker thread, so an invalid
+            # value MUST be caught here; there is no safe way to fail later.
+            ("--l7-timeout", getattr(args, "l7_timeout", None),
+             lambda v: v > 0, "must be greater than 0"),
+            ("--max-ports", getattr(args, "max_ports", None),
+             lambda v: v >= 1, "must be at least 1"),
+            ("--sample-domains", getattr(args, "sample_domains", None),
+             lambda v: v >= 1, "must be at least 1"),
+            ("--cidr-hosts", getattr(args, "cidr_hosts", None),
+             lambda v: v >= 1, "must be at least 1")):
         if _val is not None and not _ok(_val):
             extra = ""
             if _flag == "--timeout":

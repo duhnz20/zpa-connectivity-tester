@@ -1372,12 +1372,53 @@ def main():
     m.l7_timeout_for(_a)
     _a.timeout = 99.0
     check("l7 budget is resolved once and cached", m.l7_timeout_for(_a) == 8.0)
+    # l7_timeout_for runs inside a pool worker. It must NEVER raise there:
+    # SystemExit is a BaseException, so it slips past the `except Exception`
+    # in the pool handler and destroys a whole run's results. Rejection of a
+    # bad value belongs at parse time, asserted separately below.
+    for _bad in (0, -1, -0.5):
+        try:
+            _c = m.l7_timeout_for(Args(timeout=2.0, l7_timeout=_bad))
+            check(f"--l7-timeout {_bad} clamps without raising in a thread",
+                  _c == m.L7_TIMEOUT_FLOOR, f"got {_c}")
+        except BaseException as e:
+            check(f"--l7-timeout {_bad} clamps without raising in a thread",
+                  False, f"raised {type(e).__name__}")
+    for _bad in ("0", "-1"):
+        _r = subprocess.run([sys.executable, tool_path, "test", "--phase",
+                             "pre", "--targets-file", os.devnull,
+                             "--l7-timeout", _bad],
+                            capture_output=True, text=True, timeout=60,
+                            stdin=subprocess.DEVNULL)
+        check(f"--l7-timeout {_bad} rejected at parse time",
+              _r.returncode != 0
+              and "greater than 0" in (_r.stdout + _r.stderr),
+              f"rc={_r.returncode}")
+
+    # --- regressions ported from the macOS audit ---
+    _tgt = {"segment": "s", "enabled": True, "ip_anchored": False,
+            "kind": "fqdn", "domain": "x.test", "probe_domain": "x.test",
+            "ports": [111, 135, 443]}
+    _real = m.probe_port
+    def _boom(target, port, res, args):
+        if port == 135:
+            raise RuntimeError("synthetic")
+        return {**m.target_base(target), "port": port, "status": "TIMEOUT",
+                "resolved_ip": "", "zpa_intercepted": "", "protocol": "tcp",
+                "attempts": 1, "latency_ms": "", "l7_result": ""}
+    m.probe_port = _boom
     try:
-        m.l7_timeout_for(Args(timeout=2.0, l7_timeout=0))
-        check("non-positive --l7-timeout rejected", False, "no exit")
-    except SystemExit as e:
-        check("non-positive --l7-timeout rejected",
-              "greater than 0" in str(e), str(e))
+        _rows = m.probe_ports_ordered(_tgt, None, Args())
+    finally:
+        m.probe_port = _real
+    check("a failing port does not discard its target's other rows",
+          len(_rows) == 3 and any(r.get("port") == 111 for r in _rows),
+          [(r.get("port"), r.get("status")) for r in _rows])
+    check("the failing port is recorded with its port number",
+          any(r.get("port") == 135 and "PROBE_ERROR" in str(r.get("status"))
+              for r in _rows))
+    check("probe_error_row cannot itself raise on a malformed target",
+          isinstance(m.probe_error_row({}, RuntimeError("x")), dict))
 
     def _l7row(seg, l7, status="OPEN"):
         return {"segment": seg, "status": status, "l7_result": l7,

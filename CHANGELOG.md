@@ -1,5 +1,36 @@
 # Changelog
 
+## v2.1.1-windows
+Ports the defects found by the macOS line-by-line audit. Both builds share
+this code, so all of these were live here too.
+
+- **A bad `--l7-timeout` no longer destroys the run.** `l7_timeout_for`
+  called `sys.exit()`, and it is called from `probe_port` inside a pool
+  worker. `SystemExit` derives from `BaseException`, so it walked past the
+  `except Exception` in the pool handler, propagated out of `fut.result()`,
+  and threw away every result already collected. The value is now rejected
+  at parse time, before any thread starts, and the thread-side path clamps
+  instead of raising. `--max-ports`, `--sample-domains` and `--cidr-hosts`
+  are validated at parse time too.
+- **An interrupted run no longer asserts a cause.** Ctrl-C stops probing
+  wherever it happens to be, but the verdict printed with the same
+  authority as a completed run, and the findings section could still say
+  every probed entry behaved as expected. Both now say the run was
+  interrupted and that anything unreached is unknown, not negative.
+- **One failing port no longer erases its target's other rows.** An
+  exception mid-way through `probe_ports_ordered` propagated to the caller,
+  which collapsed the whole target into a single port-less `PROBE_ERROR` —
+  so ports that genuinely had been probed vanished from the CSV. Each port
+  is contained to its own row, and `probe_error_row` reads the target
+  defensively so the error path cannot itself raise.
+- **`NOT_STEERED_INTERNAL` is no longer inferred from any address at all.**
+  The presence of *any* IP was treated as a proxy for an internal address,
+  labelling public addresses internal — which reads as a steering gap and
+  sends you chasing a finding that is not there.
+- Descriptor exhaustion is reported as a probe status on a real row rather
+  than raised as a port-less error.
+- Scale figures in comments and changelog generalised to magnitudes.
+
 ## v2.1.0-windows
 PowerShell removed from the probe path, and four bugs that produced
 confidently wrong answers. Validated 444/444 on Windows 11 / Python 3.14.6,
